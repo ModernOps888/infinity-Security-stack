@@ -17,7 +17,7 @@ repository = "https://github.com/ModernOps888/infinity-Security-stack"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["macros", "ws"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors", "fs", "set-header"] }
+tower-http = { version = "0.6", features = ["trace", "cors", "fs", "set-header"] }
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
