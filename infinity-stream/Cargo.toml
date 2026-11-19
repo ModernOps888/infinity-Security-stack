@@ -15,7 +15,7 @@ repository = "https://github.com/ModernOps888/infinity-Security-stack"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = { version = "0.7", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors", "fs", "set-header"] }
 hyper = { version = "1", features = ["full"] }
