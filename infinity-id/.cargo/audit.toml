@@ -1,10 +1,6 @@
 [advisories]
-# RUSTSEC-2023-0071 (rsa Marvin Attack, timing side-channel, no upstream fix
-# exists): accepted risk. `rsa` is used only to generate/load the RS256
-# signing keypair once at startup (see crates/infinity-core/src/keys.rs) to
-# publish JWKS — this is a cold, non-request-reachable path. Actual JWT
-# signing/verification goes through `jsonwebtoken` (backed by `ring`), not
-# `rsa`, so the timing side-channel this advisory describes is not exposed
-# to any attacker-controlled input. Monitored for an upstream fix; see the
-# README security section for the full write-up.
-ignore = ["RUSTSEC-2023-0071"]
+# RUSTSEC-2026-0459 (`libsqlite3-sys` C SQLite CVE-2026-119375) was resolved by
+# upgrading `sqlx` 0.8 -> 0.9 (`libsqlite3-sys` >= 0.39.0).
+# RUSTSEC-2023-0071 (`rsa` Marvin Attack) was resolved by upgrading `rsa` 0.9 -> 0.10.
+# No active or ignored CVEs remain.
+ignore = []

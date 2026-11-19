@@ -1,4 +1,4 @@
-﻿pub fn permission_matches(granted: &str, required: &str) -> bool {
+pub fn permission_matches(granted: &str, required: &str) -> bool {
     let (gr, ga) = split(granted);
     let (rr, ra) = split(required);
     seg_match(gr, rr) && seg_match(ga, ra)

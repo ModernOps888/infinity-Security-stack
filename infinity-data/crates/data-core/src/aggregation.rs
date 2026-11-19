@@ -4,6 +4,13 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::error::{CoreError, Result};
+use crate::security::valid_column_name;
+
+pub const MAX_FILTERS: usize = 64;
+pub const MAX_SELECT_COLS: usize = 256;
+pub const MAX_GROUPS: usize = 10_000;
+pub const MAX_OUTPUT_ROWS: usize = 10_000;
+pub const MAX_INPUT_ROWS: usize = 100_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -59,7 +66,68 @@ pub struct Query {
     pub aggregate: Option<AggregateSpec>,
 }
 
+pub fn validate_query(query: &Query) -> Result<()> {
+    if query.filters.len() > MAX_FILTERS {
+        return Err(CoreError::Invalid(format!(
+            "too many filters (max {MAX_FILTERS})"
+        )));
+    }
+    for f in &query.filters {
+        if !valid_column_name(&f.column) {
+            return Err(CoreError::Invalid(format!(
+                "invalid filter column: {}",
+                f.column
+            )));
+        }
+    }
+    if let Some(cols) = &query.select {
+        if cols.len() > MAX_SELECT_COLS {
+            return Err(CoreError::Invalid(format!(
+                "too many select columns (max {MAX_SELECT_COLS})"
+            )));
+        }
+        for c in cols {
+            if !valid_column_name(c) {
+                return Err(CoreError::Invalid(format!("invalid select column: {c}")));
+            }
+        }
+    }
+    if let Some(group_col) = &query.group_by {
+        if !valid_column_name(group_col) {
+            return Err(CoreError::Invalid(format!(
+                "invalid group_by column: {group_col}"
+            )));
+        }
+    }
+    if let Some(agg) = &query.aggregate {
+        if !valid_column_name(&agg.alias) {
+            return Err(CoreError::Invalid(format!(
+                "invalid aggregate alias: {}",
+                agg.alias
+            )));
+        }
+        if let Some(col) = &agg.column {
+            if !valid_column_name(col) {
+                return Err(CoreError::Invalid(format!(
+                    "invalid aggregate column: {col}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn run_query(rows: &[Value], query: &Query) -> Result<Vec<Value>> {
+    run_query_bounded(rows, query, MAX_OUTPUT_ROWS)
+}
+
+pub fn run_query_bounded(rows: &[Value], query: &Query, limit: usize) -> Result<Vec<Value>> {
+    validate_query(query)?;
+    if rows.len() > MAX_INPUT_ROWS {
+        return Err(CoreError::Invalid(format!(
+            "input rows exceed maximum ({MAX_INPUT_ROWS})"
+        )));
+    }
     let filtered: Vec<&Value> = rows
         .iter()
         .filter(|row| matches_all(row, &query.filters))
@@ -71,17 +139,24 @@ pub fn run_query(rows: &[Value], query: &Query) -> Result<Vec<Value>> {
             .ok_or_else(|| CoreError::Invalid("group_by requires aggregate".into()))?;
         let mut groups: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
         for row in filtered {
-            groups
-                .entry(group_key(row, group_col))
-                .or_default()
-                .push(row);
+            let key = group_key(row, group_col);
+            if !groups.contains_key(&key) && groups.len() >= MAX_GROUPS {
+                return Err(CoreError::Invalid(format!(
+                    "too many distinct groups (max {MAX_GROUPS})"
+                )));
+            }
+            groups.entry(key).or_default().push(row);
         }
+        let cap = limit.clamp(1, MAX_OUTPUT_ROWS);
         let mut out = Vec::new();
         for (key, group) in groups {
             let mut obj = Map::new();
             obj.insert(group_col.clone(), Value::String(key));
             obj.insert(agg.alias.clone(), aggregate(&group, agg)?);
             out.push(Value::Object(obj));
+            if out.len() >= cap {
+                break;
+            }
         }
         return Ok(out);
     }
@@ -90,8 +165,10 @@ pub fn run_query(rows: &[Value], query: &Query) -> Result<Vec<Value>> {
         obj.insert(agg.alias.clone(), aggregate(&filtered, agg)?);
         return Ok(vec![Value::Object(obj)]);
     }
+    let cap = limit.clamp(1, MAX_OUTPUT_ROWS);
     Ok(filtered
         .into_iter()
+        .take(cap)
         .map(|row| project(row, query.select.as_deref()))
         .collect())
 }
@@ -120,7 +197,11 @@ fn matches_filter(row: &Value, filter: &Filter) -> bool {
 
 fn cmp(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => x.as_f64()?.partial_cmp(&y.as_f64()?),
+        (Value::Number(x), Value::Number(y)) => {
+            let xf = x.as_f64().filter(|v| v.is_finite())?;
+            let yf = y.as_f64().filter(|v| v.is_finite())?;
+            xf.partial_cmp(&yf)
+        }
         (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
         _ => None,
     }
@@ -142,10 +223,15 @@ fn group_key(row: &Value, column: &str) -> String {
     }
 }
 
-fn number(v: f64) -> Value {
+fn finite_number(v: f64) -> Result<Value> {
+    if !v.is_finite() {
+        return Err(CoreError::Invalid(
+            "numeric aggregate produced non-finite value".into(),
+        ));
+    }
     Number::from_f64(v)
         .map(Value::Number)
-        .unwrap_or(Value::Null)
+        .ok_or_else(|| CoreError::Invalid("numeric aggregate out of JSON range".into()))
 }
 
 fn aggregate(rows: &[&Value], agg: &AggregateSpec) -> Result<Value> {
@@ -156,20 +242,31 @@ fn aggregate(rows: &[&Value], agg: &AggregateSpec) -> Result<Value> {
                 .column
                 .as_ref()
                 .ok_or_else(|| CoreError::Invalid("numeric aggregate requires column".into()))?;
-            let values: Vec<f64> = rows
-                .iter()
-                .filter_map(|r| r.get(col).and_then(Value::as_f64))
-                .collect();
+            let mut values = Vec::new();
+            for r in rows {
+                if let Some(raw) = r.get(col) {
+                    if let Some(v) = raw.as_f64() {
+                        if !v.is_finite() {
+                            return Err(CoreError::Invalid(
+                                "non-finite number in aggregated column".into(),
+                            ));
+                        }
+                        values.push(v);
+                    }
+                }
+            }
             if values.is_empty() {
                 return Ok(Value::Null);
             }
-            Ok(match agg.op {
-                AggregateOp::Sum => number(values.iter().sum()),
-                AggregateOp::Avg => number(values.iter().sum::<f64>() / values.len() as f64),
-                AggregateOp::Min => number(values.into_iter().fold(f64::INFINITY, f64::min)),
-                AggregateOp::Max => number(values.into_iter().fold(f64::NEG_INFINITY, f64::max)),
+            match agg.op {
+                AggregateOp::Sum => finite_number(values.iter().sum()),
+                AggregateOp::Avg => finite_number(values.iter().sum::<f64>() / values.len() as f64),
+                AggregateOp::Min => finite_number(values.into_iter().fold(f64::INFINITY, f64::min)),
+                AggregateOp::Max => {
+                    finite_number(values.into_iter().fold(f64::NEG_INFINITY, f64::max))
+                }
                 AggregateOp::Count => unreachable!(),
-            })
+            }
         }
     }
 }
@@ -245,5 +342,53 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(run_query(&rows, &q).unwrap(), vec![json!({"avg_v":2.0})]);
+    }
+
+    #[test]
+    fn rejects_invalid_identifiers_and_numeric_overflow() {
+        let rows = vec![json!({"region": "eu", "amount": 1e308})];
+        let bad_col = Query {
+            filters: vec![Filter {
+                column: "region; DROP TABLE users;--".into(),
+                op: FilterOp::Eq,
+                value: json!("eu"),
+            }],
+            ..Default::default()
+        };
+        assert!(run_query(&rows, &bad_col).is_err());
+
+        let bad_alias = Query {
+            aggregate: Some(AggregateSpec {
+                op: AggregateOp::Count,
+                column: None,
+                alias: "bad alias!".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(run_query(&rows, &bad_alias).is_err());
+
+        let overflow_rows = vec![json!({"amount": 1e308}), json!({"amount": 1e308})];
+        let sum_overflow = Query {
+            aggregate: Some(AggregateSpec {
+                op: AggregateOp::Sum,
+                column: Some("amount".into()),
+                alias: "total".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(run_query(&overflow_rows, &sum_overflow).is_err());
+
+        let too_many_filters = Query {
+            filters: vec![
+                Filter {
+                    column: "region".into(),
+                    op: FilterOp::Eq,
+                    value: json!("eu"),
+                };
+                MAX_FILTERS + 1
+            ],
+            ..Default::default()
+        };
+        assert!(run_query(&rows, &too_many_filters).is_err());
     }
 }

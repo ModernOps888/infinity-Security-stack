@@ -1,12 +1,12 @@
 use axum::extract::State;
-use axum::http::header::SET_COOKIE;
-use axum::http::HeaderValue;
+use axum::http::header::{CACHE_CONTROL, PRAGMA, SET_COOKIE};
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::{Principal, SESSION_COOKIE};
+use crate::auth::{extract_cookie, Principal, PrincipalKind, SESSION_COOKIE};
 use crate::error::{ApiError, ApiResult};
 use crate::state::SharedState;
 use crate::store;
@@ -28,19 +28,24 @@ fn session_cookie(token: &str, ttl: i64, secure: bool) -> String {
     }
 }
 
-/// Cookies get the `Secure` flag by default. It is only omitted for local
-/// development over plain HTTP on loopback, so a TLS-terminating proxy
-/// deployment never accidentally ships a cleartext-capable session cookie.
-fn cookie_secure(public_url: &str) -> bool {
-    !(public_url.starts_with("http://localhost") || public_url.starts_with("http://127."))
+fn set_no_store(resp: &mut Response) {
+    resp.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp.headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
 }
 
 pub async fn login(
     State(st): State<SharedState>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Response> {
     let throttle_key = req.email.trim().to_lowercase();
-    if throttle_key.len() > 320 || req.password.len() > 1024 {
+    if throttle_key.is_empty()
+        || throttle_key.len() > 320
+        || req.password.is_empty()
+        || req.password.len() > 1024
+    {
         stream_core::password::dummy_verify(&req.password);
         return Err(ApiError::Unauthorized("invalid credentials".into()));
     }
@@ -61,6 +66,13 @@ pub async fn login(
         return Err(ApiError::Unauthorized("invalid credentials".into()));
     }
     st.login_throttle.record_success(&throttle_key);
+
+    // Session fixation prevention: invalidate any pre-existing session cookie
+    // before issuing a freshly minted CSPRNG session token.
+    if let Some(old_raw) = extract_cookie(&headers, SESSION_COOKIE) {
+        let _ = store::delete_session(&st.db, &sha256_hex(&old_raw)).await;
+    }
+
     let session = random_token();
     store::create_session(
         &st.db,
@@ -69,60 +81,71 @@ pub async fn login(
         st.config.session_ttl_secs,
     )
     .await?;
-    let mut resp = Json(json!({"user":{"id":id,"email":email,"username":username,"roles":["superadmin"],"permissions":["*:*"]}})).into_response();
+    let mut resp = Json(json!({
+        "user": {
+            "id": id,
+            "email": email,
+            "username": username,
+            "roles": ["superadmin"],
+            "permissions": ["*:*"]
+        }
+    }))
+    .into_response();
     resp.headers_mut().insert(
         SET_COOKIE,
         HeaderValue::from_str(&session_cookie(
             &session,
             st.config.session_ttl_secs,
-            cookie_secure(&st.config.public_url),
+            st.config.cookie_secure(),
         ))
         .map_err(|e| ApiError::Internal(e.to_string()))?,
     );
+    set_no_store(&mut resp);
     Ok(resp)
 }
 
 pub async fn logout(
     State(st): State<SharedState>,
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     principal: Principal,
 ) -> ApiResult<Response> {
-    if let Some(raw) = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|c| c.to_str().ok())
-        .and_then(|c| {
-            c.split(';').find_map(|kv| {
-                let (k, v) = kv.trim().split_once('=')?;
-                (k == SESSION_COOKIE).then(|| v.to_string())
-            })
-        })
-    {
+    if matches!(principal.kind, PrincipalKind::ApiKey) {
+        return Err(ApiError::Forbidden(
+            "API keys cannot manage user sessions".into(),
+        ));
+    }
+    if let Some(raw) = extract_cookie(&headers, SESSION_COOKIE) {
         store::delete_session(&st.db, &sha256_hex(&raw)).await?;
     }
     let mut resp = Json(json!({"ok":true,"subject":principal.subject})).into_response();
     resp.headers_mut().insert(
         SET_COOKIE,
-        HeaderValue::from_static("infinity_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"),
+        HeaderValue::from_str(&session_cookie("", 0, st.config.cookie_secure()))
+            .map_err(|e| ApiError::Internal(e.to_string()))?,
     );
+    set_no_store(&mut resp);
     Ok(resp)
 }
 
-pub async fn me(
-    State(st): State<SharedState>,
-    principal: Principal,
-) -> ApiResult<Json<serde_json::Value>> {
-    let (email, username) = match principal.kind {
-        crate::auth::PrincipalKind::User => store::get_user_by_id(&st.db, &principal.subject)
-            .await?
-            .unwrap_or_else(|| ("unknown".into(), "unknown".into())),
-        crate::auth::PrincipalKind::ApiKey => ("api-key".into(), "api-key".into()),
+pub async fn me(State(st): State<SharedState>, principal: Principal) -> ApiResult<Response> {
+    let ((email, username), roles) = match principal.kind {
+        PrincipalKind::User => (
+            store::get_user_by_id(&st.db, &principal.subject)
+                .await?
+                .unwrap_or_else(|| ("unknown".into(), "unknown".into())),
+            vec!["superadmin"],
+        ),
+        PrincipalKind::ApiKey => (("api-key".into(), "api-key".into()), Vec::new()),
     };
-    Ok(Json(json!({
+    let mut resp = Json(json!({
         "id": principal.subject,
         "kind": format!("{:?}", principal.kind),
         "username": username,
         "email": email,
-        "roles": ["superadmin"],
+        "roles": roles,
         "permissions": principal.permissions
-    })))
+    }))
+    .into_response();
+    set_no_store(&mut resp);
+    Ok(resp)
 }

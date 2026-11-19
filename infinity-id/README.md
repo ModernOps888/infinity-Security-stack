@@ -84,27 +84,27 @@ Infinity ID is built to withstand scrutiny from a security professional. Highlig
 | Area | Hardening |
 |---|---|
 | **Password storage** | Argon2id (memory-hard, OWASP params: 19 MiB, 2 passes) |
-| **Token signing** | RS256 with persisted key; public JWKS; algorithm pinned on validation (no `alg=none`/HS confusion) |
-| **PKCE** | Required for public clients; **only S256 accepted** (`plain` refused) |
-| **Client auth** | Confidential clients authenticated with **constant-time** secret comparison at the token endpoint **and on refresh** (RFC 6749 §6) |
-| **Auth codes** | Single-use (atomic `DELETE … RETURNING`, no redemption race), short-TTL, `redirect_uri` exact-match, bound to `client_id` |
-| **Refresh tokens** | Rotated on use; **reuse detection revokes the whole token family**; confidential-client secret required to redeem |
-| **MFA (TOTP)** | RFC 6238; codes are **one-time-use** — an accepted time-step is recorded and older/replayed codes are rejected within the skew window; recovery codes are single-use |
+| **Token signing** | RS256 with `0600` persisted key + live rotation; public JWKS; `alg=RS256` & `kid` pinned, `nbf`/`exp`/`iss`/`aud` enforced |
+| **PKCE** | Required for all authorization-code flows; **only S256 accepted** (`plain` refused) |
+| **Client auth** | Confidential clients authenticated with **constant-time** secret comparison at `/oauth/token` **and on refresh** (RFC 6749 §6); per-client `grant_types` enforced |
+| **Auth codes** | Single-use (atomic `DELETE … RETURNING`), short-TTL, strict `redirect_uri` validation (no fragments, wildcards, CRLF, or unsafe schemes) + exact-match required on `/oauth/token`, bound to `client_id` |
+| **Refresh tokens** | Atomic single-use rotation (`UPDATE … WHERE revoked = 0 RETURNING`); **reuse detection revokes the token family (`family_id`)**; confidential-client secret required |
+| **MFA (TOTP)** | RFC 6238; codes are **one-time-use** via atomic `mfa_last_step` guard, constant-time code comparison, per-account MFA brute-force lockout, step-up auth required to disable MFA, recovery codes single-use |
 | **Scopes** | Requested scopes are **narrowed to the client's registration** — no self-asserted privileged scopes |
 | **Token audience** | Management API requires a **first-party** token (audience = issuer) — third-party RP tokens can't be replayed against `/admin/*`. The edge can pin a per-route `audience` so a token minted for another client is rejected |
 | **Token type** | `id_token`s are rejected wherever an access token is expected (server **and** edge) |
-| **Sessions** | Opaque, hashed at rest, `HttpOnly` + `SameSite=Strict` (+ `Secure` by default off loopback), **server-side revocation on logout**; 2-hour default TTL and expired sessions purged at startup |
-| **Brute force** | Per-account lockout + global per-IP rate limit (Argon2 makes floods expensive, so this matters); throttle state is memory-bounded |
+| **Sessions & CSRF** | Opaque, hashed at rest, `HttpOnly` + `SameSite=Strict` (+ `Secure` on HTTPS / off loopback), session rotation on login & MFA elevation, `Origin`/`Sec-Fetch-Site` + double-submit CSRF token (`infinity_csrf` / `X-CSRF-Token`), 2-hour (`7200s`) default TTL |
+| **Brute force** | Per-account login & MFA lockouts + global per-IP rate limit honoring `trusted_proxies`; throttle/limiter state is memory-bounded |
 | **User enumeration** | Uniform errors + timing equalization; disabled-account status is only checked **after** password verification |
-| **Transport hardening** | CSP, HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy` |
+| **Transport hardening** | Strict CSP (`style-src 'self'`, no `'unsafe-inline'`), HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`, `Cache-Control: no-store` on auth/token/admin responses |
 | **Error handling** | Internal/DB errors are logged server-side and returned to clients as generic messages |
-| **Built-in roles** | `superadmin` / `admin` / `user` are **immutable via the API** — a compromised admin session can't strip superadmin permissions and lock operators out |
-| **Request safety** | 1 MiB request-body cap on all endpoints (memory-exhaustion DoS) |
+| **Built-in roles** | `superadmin` / `admin` / `user` are **immutable via the API**; admins cannot modify/delete superadmins, and non-superadmins cannot mint roles with unheld permissions |
+| **Request safety** | 1 MiB request-body cap on all server endpoints; configurable request/response body cap (`413` on overflow) on Edge |
 | **Profile scope** | `GET /auth/me` requires a **first-party** context — third-party access tokens can't read full roles/permissions |
-| **Edge** | Validates token audience; matches `required_scope` against scopes and `required_role` against roles **separately** (roles never satisfy a scope check); strips client-supplied identity headers and injects a verified `X-Infinity-Sub` |
-| **First run** | If no admin password is provided, a strong random one is generated and shown once in the logs |
+| **Edge** | Validates RS256/`kid`/`nbf`/`exp`/`iss`/`aud` with live JWKS rotation refresh; enforces `typ=access` + separate scope/role checks; strips hop-by-hop (`Connection`, etc.) and forged identity headers; enforces `trusted_proxies` XFF boundary; blocks SSRF redirects, metadata IPs, and path traversal |
+| **First run** | If `admin_password` is unset/empty, a strong random one is generated and logged once; default/placeholder passwords are rejected |
 
-> This codebase passed three rounds of automated security review. Findings from the first round (scope self-assertion, audience confusion, role-escalation, edge token-type), the second (TOTP code replay, refresh-token client authentication, auth-code redemption race, edge audience/role–scope separation), and the third (first-party `/auth/me`, immutable built-in roles, request-body cap, session TTL/purge, bounded throttle memory) were all remediated and verified. A fourth round addressed dependency vulnerabilities surfaced by `cargo audit`: `sqlx` was bumped `0.7` → `0.8`, fixing RUSTSEC-2026-0098, RUSTSEC-2026-0099, RUSTSEC-2026-0104, RUSTSEC-2024-0363, and RUSTSEC-2025-0134 (unmaintained `rustls-pemfile`), and clearing a yanked `spin` dependency. RUSTSEC-2023-0071 (Marvin Attack timing side-channel in `rsa`) remains a documented accepted risk: `rsa` is used only on a cold, startup-only key-generation/JWKS-derivation path (`crates/infinity-core/src/keys.rs`), never on a per-request attacker-reachable path, and no upstream fix exists yet.
+> Dependency CVEs surfaced by `cargo audit` were remediated across the workspace: `sqlx` was upgraded `0.8` → `0.9` (`libsqlite3-sys >= 0.39.0`, fixing `RUSTSEC-2026-0459`), `rsa` was upgraded `0.9` → `0.10` (fixing `RUSTSEC-2023-0071`), and SemVer updates cleared `h2`, `quinn-proto`, `quinn-udp`, `rustls`, `rustls-webpki`, `webpki-roots`, `tokio`, and `event-listener` — yielding **0 active vulnerabilities and 0 ignored CVEs** in `cargo audit` (with `RUSTSEC-2026-0543` informational unmaintained warning on `chrono` 0.4).
 
 **TLS:** terminate HTTPS at Infinity Edge or a load balancer; set `issuer = https://…` so cookies become `Secure`.
 
@@ -137,7 +137,7 @@ infinity-id/
 ```bash
 cd infinity-id
 # optional: cp Config.toml.example Config.toml   (or use env vars)
-INFINITY_ADMIN_PASSWORD='ChooseAStrongOne#2025' cargo run --bin infinity-id
+INFINITY_ADMIN_PASSWORD="$(openssl rand -base64 24)" cargo run --bin infinity-id
 ```
 
 Open **http://localhost:8080** and sign in with `admin@infinity.local` and your password.
@@ -147,7 +147,7 @@ Open **http://localhost:8080** and sign in with `admin@infinity.local` and your 
 
 ```bash
 cd infinity-id
-INFINITY_ADMIN_PASSWORD='ChooseAStrongOne#2025' docker compose up --build
+INFINITY_ADMIN_PASSWORD="$(openssl rand -base64 24)" docker compose up --build
 # Infinity ID  → http://localhost:8080
 # Infinity Edge → http://localhost:9000
 ```
@@ -179,6 +179,7 @@ Layered: built-in defaults → `Config.toml` → `INFINITY_*` environment variab
 | `global_rate_limit_per_min` | `600` | Per-IP request cap / 60s (0 = off) |
 | `mfa_issuer` | `Infinity ID` | Label in authenticator apps |
 | `cors_origins` | `["http://localhost:8080"]` | Allowed browser origins |
+| `trusted_proxies` | `[]` | Trusted reverse-proxy IPs/CIDRs for `X-Forwarded-For` |
 
 See [`Config.toml.example`](./Config.toml.example) and [`.env.example`](./.env.example).
 
@@ -214,6 +215,7 @@ See [`Config.toml.example`](./Config.toml.example) and [`.env.example`](./.env.e
 | `GET`/`POST` | `/admin/clients` | `clients:read` / `clients:create` |
 | `DELETE` | `/admin/clients/:client_id` | `clients:delete` |
 | `GET` | `/admin/roles` · `PUT /admin/roles` | `roles:read` / `roles:write` |
+| `POST` | `/admin/keys/rotate` | `keys:rotate` |
 | `GET` | `/admin/audit` | `audit:read` |
 
 ### Example: get a token (password grant, first-party CLI)
@@ -222,7 +224,7 @@ See [`Config.toml.example`](./Config.toml.example) and [`.env.example`](./.env.e
 curl -s -X POST http://localhost:8080/oauth/token \
   -d grant_type=password \
   -d username=admin@infinity.local \
-  -d 'password=ChooseAStrongOne#2025' \
+  -d "password=$ADMIN_PASSWORD" \
   -d scope='openid profile email'
 ```
 
@@ -243,9 +245,9 @@ curl http://localhost:8080/userinfo -H "Authorization: Bearer $ACCESS_TOKEN"
 
 A companion binary that fronts your services and enforces auth at the edge using Infinity ID's JWKS.
 
-- Validates access tokens (RS256, `typ=access` only), enforces per-route scopes/roles
-- Sliding per-IP rate limiting
-- Injects a verified `X-Infinity-Sub` header for upstreams (and strips any spoofed one)
+- Validates access tokens (`alg=RS256`, `kid`, `nbf`, `exp`, `iss`, `aud`, `typ=access` only) with live JWKS rotation refresh, and enforces per-route scopes/roles
+- Fixed-window per-IP rate limiting (60s windows) honoring `trusted_proxies`
+- Strips hop-by-hop and forged identity headers, injects a verified `X-Infinity-Sub` for upstreams, and blocks SSRF redirects and path-traversal escapes
 
 ```bash
 cp Edge.toml.example Edge.toml   # declare your routes/upstreams
@@ -282,7 +284,7 @@ required_scope = "api:access"   # matched against token scopes only
 
 - [ ] WebAuthn / passkeys
 - [ ] SAML 2.0 IdP + upstream social/enterprise connections
-- [ ] Postgres backend + signing-key rotation
+- [ ] Postgres backend + automated scheduled key rotation
 - [ ] SCIM provisioning
 - [ ] Distributed rate-limit / session store (Redis)
 - [ ] Helm chart

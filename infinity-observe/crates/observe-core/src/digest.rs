@@ -7,6 +7,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::error::{CoreError, Result};
+
+const MAX_COMPRESSION: f64 = 1_000.0;
+const MAX_CENTROIDS: usize = 8_192;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Centroid {
     pub mean: f64,
@@ -31,8 +36,13 @@ impl Default for TDigest {
 
 impl TDigest {
     pub fn new(compression: f64) -> Self {
+        let compression = if compression.is_finite() {
+            compression.clamp(20.0, MAX_COMPRESSION)
+        } else {
+            100.0
+        };
         Self {
-            compression: compression.max(20.0),
+            compression,
             centroids: Vec::new(),
             count: 0.0,
             min: f64::INFINITY,
@@ -57,19 +67,34 @@ impl TDigest {
         self.add_weighted(value, 1.0);
     }
 
+    pub fn try_add(&mut self, value: f64) -> Result<()> {
+        if !value.is_finite() {
+            return Err(CoreError::Invalid("digest value must be finite".into()));
+        }
+        self.add_weighted(value, 1.0);
+        Ok(())
+    }
+
     pub fn add_weighted(&mut self, value: f64, weight: f64) {
         if !value.is_finite() || !weight.is_finite() || weight <= 0.0 {
             return;
         }
+        let next_count = self.count + weight;
+        if !next_count.is_finite() {
+            return;
+        }
         self.min = self.min.min(value);
         self.max = self.max.max(value);
-        self.count += weight;
+        self.count = next_count;
         self.centroids.push(Centroid {
             mean: value,
             weight,
         });
-        self.uncompressed += 1;
-        if self.uncompressed > (self.compression as usize * 8).max(128) {
+        self.uncompressed = self.uncompressed.saturating_add(1);
+        let threshold = (self.compression.clamp(20.0, MAX_COMPRESSION) as usize)
+            .saturating_mul(8)
+            .max(128);
+        if self.uncompressed > threshold || self.centroids.len() > MAX_CENTROIDS {
             self.compress();
         }
     }
@@ -82,10 +107,17 @@ impl TDigest {
     }
 
     pub fn compress(&mut self) {
+        self.centroids
+            .retain(|c| c.mean.is_finite() && c.weight.is_finite() && c.weight > 0.0);
         if self.centroids.len() <= 1 {
             self.uncompressed = 0;
             return;
         }
+        let compression = if self.compression.is_finite() {
+            self.compression.clamp(20.0, MAX_COMPRESSION)
+        } else {
+            100.0
+        };
         self.centroids.sort_by(|a, b| a.mean.total_cmp(&b.mean));
         let total = self.count.max(1.0);
         let mut compressed: Vec<Centroid> = Vec::with_capacity(self.centroids.len());
@@ -96,9 +128,10 @@ impl TDigest {
             let proposed = current.weight + next.weight;
             let q = (cumulative + proposed / 2.0) / total;
             // The 4*n*q*(1-q)/delta rule is the common t-digest size bound.
-            let max_weight = (4.0 * total * q * (1.0 - q) / self.compression).max(1.0);
-            if proposed <= max_weight {
-                current.mean = (current.mean * current.weight + next.mean * next.weight) / proposed;
+            let max_weight = (4.0 * total * q * (1.0 - q) / compression).max(1.0);
+            if proposed <= max_weight && proposed.is_finite() {
+                current.mean = current.mean * (current.weight / proposed)
+                    + next.mean * (next.weight / proposed);
                 current.weight = proposed;
             } else {
                 cumulative += current.weight;
@@ -112,7 +145,7 @@ impl TDigest {
     }
 
     pub fn quantile(&self, q: f64) -> Option<f64> {
-        if self.count == 0.0 {
+        if self.count == 0.0 || !q.is_finite() || !self.min.is_finite() || !self.max.is_finite() {
             return None;
         }
         let q = q.clamp(0.0, 1.0);
@@ -123,7 +156,15 @@ impl TDigest {
             return Some(self.max);
         }
 
-        let mut cents = self.centroids.clone();
+        let mut cents: Vec<Centroid> = self
+            .centroids
+            .iter()
+            .copied()
+            .filter(|c| c.mean.is_finite() && c.weight.is_finite() && c.weight > 0.0)
+            .collect();
+        if cents.is_empty() {
+            return None;
+        }
         cents.sort_by(|a, b| a.mean.total_cmp(&b.mean));
         if cents.len() == 1 {
             return Some(cents[0].mean);
@@ -196,5 +237,28 @@ mod tests {
         }
         a.merge(&b);
         assert!((a.quantile(0.99).unwrap() - 9_900.01).abs() < 100.0);
+    }
+
+    #[test]
+    fn rejects_non_finite_values_and_nan_quantiles() {
+        let mut d = TDigest::new(f64::INFINITY);
+        assert!(d.try_add(f64::NAN).is_err());
+        assert!(d.try_add(f64::INFINITY).is_err());
+        assert!(d.try_add(f64::NEG_INFINITY).is_err());
+        d.add(f64::NAN);
+        d.add(f64::INFINITY);
+        assert!(d.is_empty());
+
+        d.try_add(f64::MAX / 2.0).unwrap();
+        d.try_add(f64::MAX / 2.0).unwrap();
+        d.compress();
+        assert!(d.quantile(f64::NAN).is_none());
+        assert!(d.quantile(f64::INFINITY).is_none());
+        let p50 = d.quantile(0.5).unwrap();
+        assert!(p50.is_finite());
+
+        let mut nan_comp = TDigest::new(f64::NAN);
+        nan_comp.add(1.0);
+        assert_eq!(nan_comp.quantile(0.5), Some(1.0));
     }
 }

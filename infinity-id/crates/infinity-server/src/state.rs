@@ -23,7 +23,9 @@ impl AppState {
     /// How long a retired key must keep validating: the longest-lived token
     /// type this server issues, so no live token can outlive its signing key.
     pub fn key_retention_secs(&self) -> i64 {
-        self.config.refresh_token_ttl_secs.max(self.config.access_token_ttl_secs)
+        self.config
+            .refresh_token_ttl_secs
+            .max(self.config.access_token_ttl_secs)
     }
 }
 

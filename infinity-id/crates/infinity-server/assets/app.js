@@ -3,9 +3,23 @@
 // ---------------------------------------------------------------------------
 // Tiny API helper
 // ---------------------------------------------------------------------------
+function getCookie(name) {
+  for (const part of document.cookie.split(";")) {
+    const idx = part.indexOf("=");
+    if (idx === -1) continue;
+    const k = part.slice(0, idx).trim();
+    if (k === name) return part.slice(idx + 1).trim();
+  }
+  return null;
+}
+
 const api = {
   async req(method, path, body) {
     const opts = { method, headers: {}, credentials: "same-origin" };
+    if (method !== "GET" && method !== "HEAD") {
+      const csrf = getCookie("infinity_csrf");
+      if (csrf) opts.headers["X-CSRF-Token"] = csrf;
+    }
     if (body !== undefined) {
       opts.headers["Content-Type"] = "application/json";
       opts.body = JSON.stringify(body);
@@ -84,6 +98,8 @@ $("#login-form").addEventListener("submit", async (e) => {
       password: $("#login-password").value,
       otp: $("#login-otp").value.trim() || null,
     });
+    $("#login-password").value = "";
+    $("#login-otp").value = "";
     ME = r.user;
     showApp();
   } catch (err) {
@@ -94,6 +110,8 @@ $("#login-form").addEventListener("submit", async (e) => {
 $("#logout").addEventListener("click", async () => {
   try { await api.post("/auth/logout", {}); } catch (_) {}
   ME = null;
+  $("#login-password").value = "";
+  $("#login-otp").value = "";
   showLogin();
 });
 
@@ -155,7 +173,7 @@ async function viewUsers(root) {
         <input id="nu-username" placeholder="username" />
         <input id="nu-name" placeholder="display name" />
         <input id="nu-pass" type="password" placeholder="password (min 8)" />
-        <select id="nu-role">${allRoles.map((r) => `<option>${esc(r)}</option>`).join("")}</select>
+        <select id="nu-role">${allRoles.map((r) => `<option value="${esc(r)}">${esc(r)}</option>`).join("")}</select>
         <button id="nu-create" class="btn primary">Add user</button>
       </div>
     </div>` : ""}
@@ -180,12 +198,12 @@ async function viewUsers(root) {
   });
 
   root.querySelectorAll("[data-toggle]").forEach((b) => b.addEventListener("click", async () => {
-    try { await api.patch(`/admin/users/${b.dataset.toggle}`, { disabled: b.dataset.disabled === "false" }); toast("Updated"); viewUsers(root); }
+    try { await api.patch(`/admin/users/${encodeURIComponent(b.dataset.toggle)}`, { disabled: b.dataset.disabled === "false" }); toast("Updated"); viewUsers(root); }
     catch (e) { toast(e.message, "err"); }
   }));
   root.querySelectorAll("[data-del]").forEach((b) => b.addEventListener("click", async () => {
     if (!confirm("Delete this user?")) return;
-    try { await api.del(`/admin/users/${b.dataset.del}`); toast("User deleted"); viewUsers(root); }
+    try { await api.del(`/admin/users/${encodeURIComponent(b.dataset.del)}`); toast("User deleted"); viewUsers(root); }
     catch (e) { toast(e.message, "err"); }
   }));
 }
@@ -195,12 +213,12 @@ function userRow(u) {
   const mfa = u.mfa_enabled ? `<span class="pill-ok">● on</span>` : `<span class="pill-off">○ off</span>`;
   const status = u.disabled ? `<span class="pill-danger">disabled</span>` : `<span class="pill-ok">active</span>`;
   const actions = [];
-  if (can("users:update")) actions.push(`<button class="btn ghost sm" data-toggle="${u.id}" data-disabled="${u.disabled}">${u.disabled ? "Enable" : "Disable"}</button>`);
-  if (can("users:delete")) actions.push(`<button class="btn danger sm" data-del="${u.id}">Delete</button>`);
+  if (can("users:update")) actions.push(`<button class="btn ghost sm" data-toggle="${esc(u.id)}" data-disabled="${esc(u.disabled)}">${u.disabled ? "Enable" : "Disable"}</button>`);
+  if (can("users:delete")) actions.push(`<button class="btn danger sm" data-del="${esc(u.id)}">Delete</button>`);
   return `<tr>
     <td><b>${esc(u.username)}</b><br><span class="muted">${esc(u.email)}</span></td>
     <td>${roles}</td><td>${mfa}</td><td>${status}</td>
-    <td style="text-align:right">${actions.join(" ")}</td></tr>`;
+    <td class="text-right">${actions.join(" ")}</td></tr>`;
 }
 
 async function viewClients(root) {
@@ -243,18 +261,18 @@ async function viewClients(root) {
 }
 
 function clientRow(c) {
-  const del = can("clients:delete") ? `<button class="btn danger sm" data-delc="${c.client_id}">Delete</button>` : "";
+  const del = can("clients:delete") ? `<button class="btn danger sm" data-delc="${esc(c.client_id)}">Delete</button>` : "";
   return `<tr>
     <td><b>${esc(c.name)}</b></td>
     <td><span class="mono">${esc(c.client_id)}</span></td>
     <td>${c.public ? `<span class="tag">public</span>` : `<span class="tag">confidential</span>`}</td>
     <td>${(c.grant_types || []).map((g) => `<span class="tag">${esc(g)}</span>`).join("")}</td>
-    <td style="text-align:right">${del}</td></tr>`;
+    <td class="text-right">${del}</td></tr>`;
 }
 function bindClientDeletes(root) {
   root.querySelectorAll("[data-delc]").forEach((b) => b.addEventListener("click", async () => {
     if (!confirm("Delete this application?")) return;
-    try { await api.del(`/admin/clients/${b.dataset.delc}`); toast("Application deleted"); viewClients(root); }
+    try { await api.del(`/admin/clients/${encodeURIComponent(b.dataset.delc)}`); toast("Application deleted"); viewClients(root); }
     catch (e) { toast(e.message, "err"); }
   }));
 }
@@ -299,10 +317,15 @@ async function viewSecurity(root) {
   </div>`;
   const actions = $("#mfa-actions");
   if (mfaOn) {
-    actions.innerHTML = `<button id="mfa-disable" class="btn danger">Disable MFA</button>`;
+    actions.innerHTML = `<div class="mfa-disable-row">
+      <input id="mfa-disable-pass" type="password" placeholder="Confirm password to disable MFA" />
+      <button id="mfa-disable" class="btn danger">Disable MFA</button>
+    </div>`;
     $("#mfa-disable").addEventListener("click", async () => {
+      const password = $("#mfa-disable-pass").value;
+      if (!password) { toast("Enter your password to disable MFA", "err"); return; }
       if (!confirm("Disable MFA for your account?")) return;
-      try { await api.post("/mfa/disable", {}); ME.mfa_enabled = false; toast("MFA disabled"); viewSecurity(root); }
+      try { await api.post("/mfa/disable", { password }); ME.mfa_enabled = false; toast("MFA disabled"); viewSecurity(root); }
       catch (e) { toast(e.message, "err"); }
     });
   } else {
@@ -311,14 +334,14 @@ async function viewSecurity(root) {
       try {
         const r = await api.post("/mfa/enroll", {});
         $("#mfa-body").innerHTML = `
-          <p class="muted" style="margin-top:16px">1. Add this secret to your authenticator (Google Authenticator, 1Password, Authy):</p>
+          <p class="muted mt-16">1. Add this secret to your authenticator (Google Authenticator, 1Password, Authy):</p>
           <div class="codebox">${esc(r.secret)}</div>
           <p class="muted">otpauth URI:</p>
           <div class="codebox">${esc(r.otpauth_uri)}</div>
           <p class="muted">2. Save these one-time recovery codes somewhere safe:</p>
           <div class="rec-codes">${r.recovery_codes.map((c) => `<span class="mono">${esc(c)}</span>`).join("")}</div>
-          <p class="muted" style="margin-top:16px">3. Enter the current 6-digit code to activate:</p>
-          <div class="form-row" style="max-width:320px">
+          <p class="muted mt-16">3. Enter the current 6-digit code to activate:</p>
+          <div class="form-row max-w-320">
             <input id="mfa-code" placeholder="123456" inputmode="numeric" />
             <button id="mfa-activate" class="btn primary">Activate</button>
           </div>`;

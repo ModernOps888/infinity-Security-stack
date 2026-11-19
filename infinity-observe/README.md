@@ -9,7 +9,7 @@
 A fast, single-binary, self-hostable alternative to **Datadog, Splunk, New Relic and Sentry** — built for teams that want strong security controls, predictable cost and operational ownership.
 
 [![Rust](https://img.shields.io/badge/built%20with-Rust-000000?logo=rust)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](../LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange)]()
 
 </div>
@@ -87,20 +87,22 @@ Infinity Observe is hardened by default:
 
 | Area | Hardening |
 |---|---|
-| **Password storage** | Argon2id (memory-hard OWASP parameters: 19 MiB, 2 passes). |
-| **First run** | If `OBSERVE_ADMIN_PASSWORD` is not set, a strong random admin password is generated and printed once in logs. |
-| **Sessions** | Opaque random token, hashed at rest, server-side expiration/revocation, `HttpOnly`, `SameSite=Strict`, `Secure` by default (omitted only for loopback dev); 2-hour default TTL and expired sessions purged at startup. |
-| **RBAC** | Admin-only guards for alert mutation and ingest-key management; viewer role is read-only. |
+| **Password storage** | Argon2id (memory-hard OWASP parameters: 19 MiB, 2 passes, p=1); rejects weak/placeholder bootstrap admin passwords. |
+| **First run** | If `OBSERVE_ADMIN_PASSWORD` is unset/empty, a strong random admin password is generated and printed once in startup logs. |
+| **Sessions** | Opaque random token, hashed at rest, server-side expiration/revocation (purged at startup and lazily on expiry), session fixation invalidation on re-login, `HttpOnly`, `SameSite=Strict`, `Secure` by default (omitted only for exact loopback `http://localhost`, `127.0.0.0/8`, or `[::1]`), `Cache-Control: no-store`; 2-hour default TTL. |
+| **RBAC** | Admin-only guards for alert mutation and ingest-key management; viewer role is read-only; unknown roles fail closed with zero permissions. |
 | **Ingest auth** | Logs/metrics/traces require `Authorization: Bearer <ingest-key>`; keys are resolved via an **O(1) indexed hash lookup** with constant-time confirmation — auth cost doesn't grow with the number of keys. |
-| **Brute force** | Per-account login lockout plus global per-IP fixed-window rate limiting; throttle state is memory-bounded. |
+| **Brute force & XFF** | Per-account and per-IP login lockout plus global per-IP fixed-window rate limiting with memory-bounded maps; `X-Forwarded-For`/`X-Real-IP` ignored unless peer matches `trusted_proxies`. |
 | **User enumeration** | Uniform login errors and dummy Argon2id verification for unknown users; disabled-account status is checked only after password verification. |
-| **Transport hardening** | CSP, HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`. |
-| **Error handling** | DB/internal errors are logged server-side and returned to clients as generic JSON. |
-| **SQL safety** | All queries use `sqlx` bind parameters; dynamic log search appends only fixed SQL fragments. |
-| **Request safety** | Configurable body limit, batch caps and string/JSON size validation. |
+| **SSRF protection** | Alert webhooks require `https://` by default, block loopback/RFC1918/CGNAT/link-local/cloud metadata (`169.254.169.254`)/IPv6 ULA/mapped-IPv6/internal hostnames, disable HTTP redirects, and pin validated DNS IPs on dispatch (opt-in overrides via `allow_insecure_webhooks` / `allow_private_webhooks`). |
+| **Transport & UI hardening** | Strict CSP (no `'unsafe-inline'`), HSTS, `X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `Referrer-Policy`, `Permissions-Policy`, `Origin`/`Sec-Fetch-Site` CSRF guard, HTML-escaped SPA rendering. |
+| **Error handling** | DB/internal errors are logged server-side (control-char sanitized) and returned to clients as generic JSON. |
+| **SQL & Query safety** | All queries use `sqlx` bind parameters; `LIKE` search escapes `\`, `%`, `_` (`ESCAPE '\'`) and caps tokens/ranges/limits. |
+| **Ingestion & DoS bounds** | Configurable `DefaultBodyLimit`, atomic transactional batching, attribute/tag cardinality & depth caps, CRLF/control/bidi sanitization, strict UTC timestamp & finite numeric/histogram validation. |
+| **Agent safety** | `infinity-observe-agent` requires `https://` for non-loopback servers (`--allow-insecure-http` opt-in), disables redirects, redacts `ingest_key` in `Debug`, and batches file tails. |
 | **Secret hygiene** | `.gitignore` excludes `data/`, `target/`, databases, keys, logs and `.env` files. |
 | **JWTs/JWKS** | Infinity Observe does not issue JWTs; ingest uses opaque API keys and the dashboard uses server-side sessions. |
-| **Dependency hardening (4th round)** | `sqlx` upgraded 0.7 → 0.8, resolving RUSTSEC-2026-0098/0099/0104, RUSTSEC-2024-0363 and RUSTSEC-2025-0134 (vulnerable/unmaintained TLS deps and a yanked `spin` transitive). The unused `rsa` dependency (RUSTSEC-2023-0071, Marvin Attack timing side-channel) was removed outright — it had zero call sites in this codebase. `cargo audit` still lists RUSTSEC-2023-0071 in `Cargo.lock` purely because `sqlx`'s optional MySQL backend (unused — this service is SQLite-only) pins a transitive `rsa` version that's never compiled into or reachable from this binary (confirmed via `cargo tree -i rsa`); suppressed via `.cargo/audit.toml` with the reasoning documented there. `cargo audit` now passes clean. |
+| **Dependency hardening** | `sqlx` upgraded `0.8 -> 0.9` (`sqlx 0.9.1`, `libsqlite3-sys 0.40.0` resolving `RUSTSEC-2026-0459`), `quinn-proto`/`quinn-udp`/`rustls`/`rustls-webpki`/`webpki-roots` updated, and `rsa` (`RUSTSEC-2023-0071`) completely removed from `Cargo.lock` (`cargo tree -i rsa` confirms absent). `cargo audit` passes with **0 active vulnerabilities** and `.cargo/audit.toml` `ignore = []` (`RUSTSEC-2026-0543` informational `chrono 0.4` unmaintained warning remains tracked). |
 
 **TLS:** terminate HTTPS at a load balancer or reverse proxy. Session cookies are marked `Secure` by default for any non-loopback `OBSERVE_PUBLIC_URL`, so browsers only send them over HTTPS.
 
@@ -129,8 +131,10 @@ infinity-observe/
 ### Run locally (Rust)
 
 ```powershell
-Set-Location C:\Users\bchmi\infinity-stack\infinity-observe
-$env:OBSERVE_ADMIN_PASSWORD = 'ChooseAStrongOne#2026'
+Set-Location path\to\infinity-observe
+# Leave OBSERVE_ADMIN_PASSWORD unset to auto-generate a strong password on startup,
+# or generate one explicitly:
+$env:OBSERVE_ADMIN_PASSWORD = [Convert]::ToBase64String((1..24 | ForEach-Object { [byte](Get-Random -Maximum 256) }))
 cargo run --bin infinity-observe
 ```
 
@@ -175,8 +179,11 @@ Layered: built-in defaults → `Config.toml` → `OBSERVE_*` environment variabl
 | `global_rate_limit_per_min` / `OBSERVE_GLOBAL_RATE_LIMIT_PER_MIN` | `600` | Per-IP request cap per minute (`0` disables). |
 | `max_request_body_bytes` / `OBSERVE_MAX_REQUEST_BODY_BYTES` | `1048576` | Maximum JSON body size. |
 | `admin_email` / `OBSERVE_ADMIN_EMAIL` | `admin@infinity.local` | Seed admin email on first run. |
-| `admin_password` / `OBSERVE_ADMIN_PASSWORD` | generated if unset | Seed admin password on first run. |
+| `admin_password` / `OBSERVE_ADMIN_PASSWORD` | generated if unset | Seed admin password on first run (weak/placeholder passwords rejected). |
 | `cors_origins` / `OBSERVE_CORS_ORIGINS` | localhost origins | Allowed browser origins. |
+| `allow_insecure_webhooks` / `OBSERVE_ALLOW_INSECURE_WEBHOOKS` | `false` | Opt-in to allow `http://` alert webhooks (`https://` only by default). |
+| `allow_private_webhooks` / `OBSERVE_ALLOW_PRIVATE_WEBHOOKS` | `false` | Opt-in to allow private/loopback/link-local webhook IPs (blocked by default). |
+| `trusted_proxies` / `OBSERVE_TRUSTED_PROXIES` | `[]` | Reverse-proxy IPs/CIDRs allowed to supply `X-Forwarded-For` / `X-Real-IP`. |
 
 ---
 
@@ -222,7 +229,7 @@ All query/admin endpoints require the dashboard session cookie.
 | `GET` | `/v1/traces/:trace_id` | `traces:read` |
 | `GET` | `/v1/alerts` | `alerts:read` |
 | `GET` | `/v1/alerts/rules` | `alerts:read` |
-| `POST` | `/v1/alerts/rules` | `alerts:create` |
+| `POST` | `/v1/alerts/rules` | `alerts:create` (optional SSRF-checked `webhook_url`) |
 | `DELETE` | `/v1/alerts/rules/:id` | `alerts:delete` |
 | `GET` | `/v1/keys` | `keys:read` |
 | `POST` | `/v1/keys` | `keys:create` |

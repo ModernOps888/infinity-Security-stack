@@ -1,4 +1,4 @@
-﻿[package]
+[package]
 name = "stream-cli"
 version.workspace = true
 edition.workspace = true
@@ -14,4 +14,6 @@ path = "src/main.rs"
 anyhow.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
+stream-core = { path = "../stream-core" }
 tokio.workspace = true
+url.workspace = true

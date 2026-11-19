@@ -51,6 +51,9 @@ impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         match e {
             sqlx::Error::RowNotFound => ApiError::NotFound("resource not found".into()),
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                ApiError::Conflict("resource already exists".into())
+            }
             other => ApiError::Internal(format!("database operation failed: {other}")),
         }
     }

@@ -7,11 +7,23 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
 use crate::state::SharedState;
 use crate::store::{self, LogFilter};
+use crate::util::{has_control_or_bidi, normalize_utc_rfc3339};
 
 fn bounded(opt: Option<&str>, max: usize, field: &str) -> ApiResult<Option<String>> {
     match opt.map(str::trim).filter(|s| !s.is_empty()) {
-        Some(v) if v.len() > max => Err(ApiError::BadRequest(format!("{field} is too long"))),
+        Some(v) if v.len() > max || has_control_or_bidi(v) => Err(ApiError::BadRequest(format!(
+            "{field} is invalid or too long"
+        ))),
         Some(v) => Ok(Some(v.to_string())),
+        None => Ok(None),
+    }
+}
+
+fn bounded_since(opt: Option<&str>) -> ApiResult<Option<String>> {
+    match bounded(opt, 64, "since")? {
+        Some(raw) => normalize_utc_rfc3339(&raw)
+            .map(Some)
+            .map_err(|m| ApiError::BadRequest(format!("since {m}"))),
         None => Ok(None),
     }
 }
@@ -46,7 +58,15 @@ pub async fn logs(
     let service = bounded(params.service.as_deref(), 160, "service")?;
     let level = bounded(params.level.as_deref(), 16, "level")?;
     let q = bounded(params.q.as_deref(), 512, "q")?;
-    let since = bounded(params.since.as_deref(), 64, "since")?;
+    if q.as_deref()
+        .map(|s| s.split_whitespace().count() > 16)
+        .unwrap_or(false)
+    {
+        return Err(ApiError::BadRequest(
+            "too many search tokens (max 16)".into(),
+        ));
+    }
+    let since = bounded_since(params.since.as_deref())?;
     let rows = store::list_logs(
         &st.db,
         LogFilter {
@@ -78,7 +98,7 @@ pub async fn metric_series(
     principal.require("metrics:read")?;
     let name = bounded(params.name.as_deref(), 240, "name")?
         .ok_or_else(|| ApiError::BadRequest("name is required".into()))?;
-    let since = bounded(params.since.as_deref(), 64, "since")?;
+    let since = bounded_since(params.since.as_deref())?;
     let rows = store::metric_series(&st.db, &name, since.as_deref()).await?;
     Ok(Json(json!({ "series": rows })))
 }
@@ -101,8 +121,10 @@ pub async fn trace_by_id(
     Path(trace_id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("traces:read")?;
-    if trace_id.len() > 128 {
-        return Err(ApiError::BadRequest("trace_id is too long".into()));
+    if trace_id.trim().is_empty() || trace_id.len() > 128 || has_control_or_bidi(&trace_id) {
+        return Err(ApiError::BadRequest(
+            "trace_id is invalid or too long".into(),
+        ));
     }
     let spans = store::get_trace(&st.db, &trace_id).await?;
     if spans.is_empty() {

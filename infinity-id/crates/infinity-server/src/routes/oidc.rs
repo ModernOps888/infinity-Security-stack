@@ -1,7 +1,8 @@
 //! OAuth2 / OpenID Connect endpoints: discovery, JWKS, authorize, token, userinfo.
 
 use axum::extract::{Form, Query, State};
-use axum::response::{IntoResponse, Redirect, Response};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::Utc;
 use infinity_core::token::{issue, Claims};
@@ -12,7 +13,9 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
 use crate::state::SharedState;
 use crate::store;
-use crate::util::{random_token, sha256_hex, verify_pkce};
+use crate::util::{
+    random_token, sha256_hex, validate_pkce_challenge, validate_redirect_uri, verify_pkce,
+};
 
 /// OIDC discovery document at `/.well-known/openid-configuration`.
 pub async fn discovery(State(st): State<SharedState>) -> Json<serde_json::Value> {
@@ -37,7 +40,8 @@ pub async fn discovery(State(st): State<SharedState>) -> Json<serde_json::Value>
 /// any keys retired by a rotation that are still within their validity
 /// window, so in-flight tokens keep validating.
 pub async fn jwks(State(st): State<SharedState>) -> Json<serde_json::Value> {
-    Json(serde_json::to_value(st.key.read().unwrap().jwks()).unwrap())
+    let ring = st.key.read().unwrap_or_else(|e| e.into_inner());
+    Json(serde_json::to_value(ring.jwks()).unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -66,7 +70,12 @@ pub async fn mint_access_token(
         preferred_username: username.map(|s| s.to_string()),
         typ: typ.to_string(),
     };
-    let active = st.key.read().unwrap().active.clone();
+    let active = st
+        .key
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .active
+        .clone();
     Ok(issue(&active, &claims)?)
 }
 
@@ -75,14 +84,19 @@ pub async fn issue_refresh(
     user_id: &str,
     client_id: &str,
     scope: &str,
+    family_id: Option<&str>,
 ) -> ApiResult<String> {
     let token = random_token();
+    let fid = family_id
+        .map(str::to_string)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     store::insert_refresh(
         &st.db,
         &sha256_hex(&token),
         user_id,
         client_id,
         scope,
+        &fid,
         st.config.refresh_token_ttl_secs,
     )
     .await?;
@@ -96,11 +110,13 @@ const STANDARD_SCOPES: &[&str] = &["openid", "profile", "email", "offline_access
 /// standard OIDC scopes plus the client's registered resource scopes. This
 /// prevents callers from self-asserting arbitrary (e.g. privileged) scopes.
 pub fn narrow_scope(requested: &str, allowed: &[String]) -> String {
-    requested
-        .split_whitespace()
-        .filter(|s| STANDARD_SCOPES.contains(s) || allowed.iter().any(|a| a == s))
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out: Vec<&str> = Vec::new();
+    for s in requested.split_whitespace() {
+        if (STANDARD_SCOPES.contains(&s) || allowed.iter().any(|a| a == s)) && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out.join(" ")
 }
 
 /// Build a full token response (access + optional refresh + optional id_token).
@@ -108,6 +124,7 @@ pub fn narrow_scope(requested: &str, allowed: &[String]) -> String {
 /// `aud` is the access-token audience (resource server / issuer for first-party
 /// tokens); `client_id` identifies the client for the id_token audience and for
 /// refresh-token bookkeeping.
+#[allow(clippy::too_many_arguments)]
 pub async fn token_response(
     st: &SharedState,
     user_id: &str,
@@ -116,6 +133,7 @@ pub async fn token_response(
     client_id: &str,
     scope: &str,
     with_refresh: bool,
+    family_id: Option<&str>,
 ) -> ApiResult<serde_json::Value> {
     let access = mint_access_token(st, user_id, username, aud, scope, "access").await?;
     let mut body = json!({
@@ -130,7 +148,7 @@ pub async fn token_response(
         body["id_token"] = json!(id_token);
     }
     if with_refresh {
-        let refresh = issue_refresh(st, user_id, client_id, scope).await?;
+        let refresh = issue_refresh(st, user_id, client_id, scope, family_id).await?;
         body["refresh_token"] = json!(refresh);
     }
     Ok(body)
@@ -160,23 +178,35 @@ pub async fn authorize(
     Query(p): Query<AuthorizeParams>,
 ) -> ApiResult<Response> {
     if p.response_type != "code" {
-        return Err(ApiError::BadRequest("only response_type=code is supported".into()));
+        return Err(ApiError::BadRequest(
+            "only response_type=code is supported".into(),
+        ));
     }
+    if p.state.len() > 512 || p.state.chars().any(|c| c.is_control()) {
+        return Err(ApiError::BadRequest("invalid state parameter".into()));
+    }
+    validate_redirect_uri(&p.redirect_uri).map_err(|e| ApiError::BadRequest(e.into()))?;
+
     let (client, _) = store::get_client_raw(&st.db, &p.client_id)
         .await?
         .ok_or_else(|| ApiError::BadRequest("unknown client_id".into()))?;
+    if !client.grant_types.iter().any(|g| g == "authorization_code") {
+        return Err(ApiError::BadRequest(
+            "client not permitted for authorization_code".into(),
+        ));
+    }
     if !client.redirect_uris.iter().any(|u| u == &p.redirect_uri) {
         return Err(ApiError::BadRequest("redirect_uri not registered".into()));
     }
-    if client.public && p.code_challenge.is_none() {
-        return Err(ApiError::BadRequest("PKCE code_challenge required for public clients".into()));
-    }
-    // Enforce PKCE S256 only — `plain` exposes the verifier and is refused.
-    if p.code_challenge.is_some() {
-        match p.code_challenge_method.as_deref() {
-            Some("S256") => {}
-            _ => return Err(ApiError::BadRequest("code_challenge_method must be S256".into())),
-        }
+    // Enforce PKCE S256 across all authorization_code requests (RFC 9700 §2.1.1).
+    let challenge = p
+        .code_challenge
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("PKCE code_challenge (S256) is required".into()))?;
+    if !validate_pkce_challenge(challenge, p.code_challenge_method.as_deref()) {
+        return Err(ApiError::BadRequest(
+            "code_challenge_method must be S256 with a valid base64url SHA-256 challenge".into(),
+        ));
     }
 
     // Never grant more scope than the client is registered for.
@@ -190,16 +220,35 @@ pub async fn authorize(
         &principal.user_id,
         &p.redirect_uri,
         &scope,
-        p.code_challenge.as_deref(),
-        p.code_challenge_method.as_deref(),
+        Some(challenge),
+        Some("S256"),
         st.config.code_ttl_secs,
     )
     .await?;
-    store::audit(&st.db, &principal.user_id, "oauth.authorize", Some(&p.client_id), None, None).await;
+    store::audit(
+        &st.db,
+        &principal.user_id,
+        "oauth.authorize",
+        Some(&p.client_id),
+        None,
+        None,
+    )
+    .await;
 
-    let sep = if p.redirect_uri.contains('?') { '&' } else { '?' };
-    let location = format!("{}{}code={}&state={}", p.redirect_uri, sep, code, p.state);
-    Ok(Redirect::to(&location).into_response())
+    // Construct redirect URL safely (properly percent-encoding query parameters
+    // and never calling panicking Redirect::to on malformed input).
+    let mut target = url::Url::parse(&p.redirect_uri)
+        .map_err(|_| ApiError::BadRequest("invalid redirect_uri".into()))?;
+    {
+        let mut qp = target.query_pairs_mut();
+        qp.append_pair("code", &code);
+        if !p.state.is_empty() {
+            qp.append_pair("state", &p.state);
+        }
+    }
+    let location = HeaderValue::from_str(target.as_str())
+        .map_err(|_| ApiError::BadRequest("invalid redirect location".into()))?;
+    Ok((StatusCode::FOUND, [(header::LOCATION, location)]).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -237,23 +286,33 @@ pub async fn token(
         "refresh_token" => grant_refresh(&st, p).await,
         "client_credentials" => grant_client_credentials(&st, p).await,
         "password" => grant_password(&st, p).await,
-        other => Err(ApiError::BadRequest(format!("unsupported grant_type: {other}"))),
+        other => Err(ApiError::BadRequest(format!(
+            "unsupported grant_type: {other}"
+        ))),
     }
 }
 
 async fn grant_auth_code(st: &SharedState, p: TokenParams) -> ApiResult<Json<serde_json::Value>> {
-    let code = p.code.ok_or_else(|| ApiError::BadRequest("code required".into()))?;
+    let code = p
+        .code
+        .ok_or_else(|| ApiError::BadRequest("code required".into()))?;
     let row = store::take_auth_code(&st.db, &code)
         .await?
         .ok_or_else(|| ApiError::BadRequest("invalid or used code".into()))?;
 
-    if chrono::DateTime::parse_from_rfc3339(&row.expires_at).map(|t| t < Utc::now()).unwrap_or(true) {
+    if chrono::DateTime::parse_from_rfc3339(&row.expires_at)
+        .map(|t| t <= Utc::now())
+        .unwrap_or(true)
+    {
         return Err(ApiError::BadRequest("authorization code expired".into()));
     }
-    if let Some(ru) = &p.redirect_uri {
-        if ru != &row.redirect_uri {
-            return Err(ApiError::BadRequest("redirect_uri mismatch".into()));
-        }
+    // RFC 6749 §4.1.3: redirect_uri is REQUIRED when it was sent to /authorize
+    // and MUST match identically.
+    let ru = p
+        .redirect_uri
+        .ok_or_else(|| ApiError::BadRequest("redirect_uri required".into()))?;
+    if ru != row.redirect_uri {
+        return Err(ApiError::BadRequest("redirect_uri mismatch".into()));
     }
 
     // Authenticate the client. The client_id must match the one the code was
@@ -263,35 +322,42 @@ async fn grant_auth_code(st: &SharedState, p: TokenParams) -> ApiResult<Json<ser
         .clone()
         .ok_or_else(|| ApiError::BadRequest("client_id required".into()))?;
     if client_id != row.client_id {
-        return Err(ApiError::BadRequest("client_id does not match authorization code".into()));
+        return Err(ApiError::BadRequest(
+            "client_id does not match authorization code".into(),
+        ));
     }
     let (client, secret_hash) = store::get_client_raw(&st.db, &client_id)
         .await?
         .ok_or_else(|| ApiError::Unauthorized("unknown client".into()))?;
-    if client.public {
-        // Public clients cannot keep a secret and MUST use PKCE.
-        if row.code_challenge.is_none() {
-            return Err(ApiError::BadRequest("PKCE required for public clients".into()));
-        }
-    } else {
+    if !client.grant_types.iter().any(|g| g == "authorization_code") {
+        return Err(ApiError::BadRequest(
+            "client not permitted for authorization_code".into(),
+        ));
+    }
+    if !client.public {
         let secret = p
             .client_secret
             .clone()
             .ok_or_else(|| ApiError::Unauthorized("client authentication required".into()))?;
         let stored = secret_hash
             .ok_or_else(|| ApiError::Internal("confidential client missing secret".into()))?;
-        if !infinity_core::password::constant_time_eq(sha256_hex(&secret).as_bytes(), stored.as_bytes()) {
+        if !infinity_core::password::constant_time_eq(
+            sha256_hex(&secret).as_bytes(),
+            stored.as_bytes(),
+        ) {
             return Err(ApiError::Unauthorized("invalid client credentials".into()));
         }
     }
 
-    if let Some(challenge) = &row.code_challenge {
-        let verifier = p
-            .code_verifier
-            .ok_or_else(|| ApiError::BadRequest("code_verifier required".into()))?;
-        if !verify_pkce(&verifier, challenge, row.code_challenge_method.as_deref()) {
-            return Err(ApiError::BadRequest("PKCE verification failed".into()));
-        }
+    let challenge = row
+        .code_challenge
+        .as_deref()
+        .ok_or_else(|| ApiError::BadRequest("PKCE challenge missing".into()))?;
+    let verifier = p
+        .code_verifier
+        .ok_or_else(|| ApiError::BadRequest("code_verifier required".into()))?;
+    if !verify_pkce(&verifier, challenge, row.code_challenge_method.as_deref()) {
+        return Err(ApiError::BadRequest("PKCE verification failed".into()));
     }
 
     let user = store::get_user_row(&st.db, &row.user_id)
@@ -300,31 +366,39 @@ async fn grant_auth_code(st: &SharedState, p: TokenParams) -> ApiResult<Json<ser
     if user.disabled != 0 {
         return Err(ApiError::Forbidden("account disabled".into()));
     }
-    let body = token_response(st, &row.user_id, Some(&user.username), &row.client_id, &row.client_id, &row.scope, true).await?;
-    store::audit(&st.db, &row.user_id, "token.issue", Some(&row.client_id), None, Some("authorization_code")).await;
+    let body = token_response(
+        st,
+        &row.user_id,
+        Some(&user.username),
+        &row.client_id,
+        &row.client_id,
+        &row.scope,
+        true,
+        None,
+    )
+    .await?;
+    store::audit(
+        &st.db,
+        &row.user_id,
+        "token.issue",
+        Some(&row.client_id),
+        None,
+        Some("authorization_code"),
+    )
+    .await;
     Ok(Json(body))
 }
 
 async fn grant_refresh(st: &SharedState, p: TokenParams) -> ApiResult<Json<serde_json::Value>> {
-    let token = p.refresh_token.ok_or_else(|| ApiError::BadRequest("refresh_token required".into()))?;
+    let token = p
+        .refresh_token
+        .ok_or_else(|| ApiError::BadRequest("refresh_token required".into()))?;
     let hash = sha256_hex(&token);
     let row = store::get_refresh(&st.db, &hash)
         .await?
         .ok_or_else(|| ApiError::Unauthorized("invalid refresh token".into()))?;
-    if row.revoked != 0 {
-        // Reuse of a rotated/revoked token is a strong compromise signal:
-        // revoke the whole family for this user+client.
-        store::revoke_refresh_family(&st.db, &row.user_id, &row.client_id).await?;
-        store::audit(&st.db, &row.user_id, "token.refresh_reuse", Some(&row.client_id), None, None).await;
-        return Err(ApiError::Unauthorized("refresh token revoked".into()));
-    }
-    if chrono::DateTime::parse_from_rfc3339(&row.expires_at).map(|t| t < Utc::now()).unwrap_or(true) {
-        return Err(ApiError::Unauthorized("refresh token expired".into()));
-    }
-    // Authenticate the client the token was issued to (RFC 6749 §6). A presented
-    // client_id must match the token's client; registered confidential clients
-    // must also present a valid secret so a stolen refresh token alone cannot be
-    // redeemed. Public / first-party (unregistered) clients keep no secret.
+
+    // Authenticate the client before mutating/revoking token state (RFC 6749 §6).
     if let Some(cid) = &p.client_id {
         if cid != &row.client_id {
             return Err(ApiError::Unauthorized(
@@ -333,6 +407,11 @@ async fn grant_refresh(st: &SharedState, p: TokenParams) -> ApiResult<Json<serde
         }
     }
     if let Some((client, secret_hash)) = store::get_client_raw(&st.db, &row.client_id).await? {
+        if !client.grant_types.iter().any(|g| g == "refresh_token") {
+            return Err(ApiError::Unauthorized(
+                "client not permitted for refresh_token".into(),
+            ));
+        }
         if !client.public {
             let secret = p
                 .client_secret
@@ -348,34 +427,122 @@ async fn grant_refresh(st: &SharedState, p: TokenParams) -> ApiResult<Json<serde
             }
         }
     }
-    // Rotate: revoke the presented token and mint a fresh pair.
-    store::revoke_refresh(&st.db, &hash).await?;
-    let user = store::get_user_row(&st.db, &row.user_id)
+
+    if row.revoked != 0 {
+        // Reuse of a rotated/revoked token is a strong compromise signal:
+        // revoke the whole token family.
+        store::revoke_refresh_family(
+            &st.db,
+            row.family_id.as_deref(),
+            &row.user_id,
+            &row.client_id,
+        )
+        .await?;
+        store::audit(
+            &st.db,
+            &row.user_id,
+            "token.refresh_reuse",
+            Some(&row.client_id),
+            None,
+            None,
+        )
+        .await;
+        return Err(ApiError::Unauthorized("refresh token revoked".into()));
+    }
+    if chrono::DateTime::parse_from_rfc3339(&row.expires_at)
+        .map(|t| t <= Utc::now())
+        .unwrap_or(true)
+    {
+        return Err(ApiError::Unauthorized("refresh token expired".into()));
+    }
+
+    // Atomic single-use rotation: if another concurrent request rotated this
+    // token between SELECT and UPDATE, treat it as reuse and revoke the family.
+    let Some(rotated) = store::take_refresh_for_rotation(&st.db, &hash).await? else {
+        store::revoke_refresh_family(
+            &st.db,
+            row.family_id.as_deref(),
+            &row.user_id,
+            &row.client_id,
+        )
+        .await?;
+        store::audit(
+            &st.db,
+            &row.user_id,
+            "token.refresh_reuse",
+            Some(&row.client_id),
+            None,
+            None,
+        )
+        .await;
+        return Err(ApiError::Unauthorized("refresh token revoked".into()));
+    };
+
+    let user = store::get_user_row(&st.db, &rotated.user_id)
         .await?
         .ok_or_else(|| ApiError::Unauthorized("user no longer exists".into()))?;
     if user.disabled != 0 {
         return Err(ApiError::Forbidden("account disabled".into()));
     }
-    let body = token_response(st, &row.user_id, Some(&user.username), &row.client_id, &row.client_id, &row.scope, true).await?;
+    let body = token_response(
+        st,
+        &rotated.user_id,
+        Some(&user.username),
+        &rotated.client_id,
+        &rotated.client_id,
+        &rotated.scope,
+        true,
+        rotated.family_id.as_deref(),
+    )
+    .await?;
     Ok(Json(body))
 }
 
-async fn grant_client_credentials(st: &SharedState, p: TokenParams) -> ApiResult<Json<serde_json::Value>> {
-    let client_id = p.client_id.ok_or_else(|| ApiError::BadRequest("client_id required".into()))?;
-    let secret = p.client_secret.ok_or_else(|| ApiError::Unauthorized("client_secret required".into()))?;
+async fn grant_client_credentials(
+    st: &SharedState,
+    p: TokenParams,
+) -> ApiResult<Json<serde_json::Value>> {
+    let client_id = p
+        .client_id
+        .ok_or_else(|| ApiError::BadRequest("client_id required".into()))?;
+    let secret = p
+        .client_secret
+        .ok_or_else(|| ApiError::Unauthorized("client_secret required".into()))?;
     let (client, stored) = store::get_client_raw(&st.db, &client_id)
         .await?
         .ok_or_else(|| ApiError::Unauthorized("invalid client".into()))?;
+    if !client.grant_types.iter().any(|g| g == "client_credentials") {
+        return Err(ApiError::Unauthorized(
+            "client not permitted for client_credentials".into(),
+        ));
+    }
     let stored = stored.ok_or_else(|| ApiError::Unauthorized("client is public".into()))?;
-    if !infinity_core::password::constant_time_eq(sha256_hex(&secret).as_bytes(), stored.as_bytes()) {
+    if !infinity_core::password::constant_time_eq(sha256_hex(&secret).as_bytes(), stored.as_bytes())
+    {
         return Err(ApiError::Unauthorized("invalid client credentials".into()));
     }
     // Bound the granted scope to what the client is registered for.
     let requested = p.scope.unwrap_or_else(|| client.scopes.join(" "));
     let scope = narrow_scope(&requested, &client.scopes);
     // Subject is the client itself (machine-to-machine).
-    let access = mint_access_token(st, &client_id, Some(&client.name), &client_id, &scope, "access").await?;
-    store::audit(&st.db, &client_id, "token.issue", Some(&client_id), None, Some("client_credentials")).await;
+    let access = mint_access_token(
+        st,
+        &client_id,
+        Some(&client.name),
+        &client_id,
+        &scope,
+        "access",
+    )
+    .await?;
+    store::audit(
+        &st.db,
+        &client_id,
+        "token.issue",
+        Some(&client_id),
+        None,
+        Some("client_credentials"),
+    )
+    .await;
     Ok(Json(json!({
         "access_token": access,
         "token_type": "Bearer",
@@ -385,16 +552,37 @@ async fn grant_client_credentials(st: &SharedState, p: TokenParams) -> ApiResult
 }
 
 async fn grant_password(st: &SharedState, p: TokenParams) -> ApiResult<Json<serde_json::Value>> {
-    let username = p.username.ok_or_else(|| ApiError::BadRequest("username required".into()))?;
-    let password = p.password.ok_or_else(|| ApiError::BadRequest("password required".into()))?;
+    let username = p
+        .username
+        .ok_or_else(|| ApiError::BadRequest("username required".into()))?;
+    let password = p
+        .password
+        .ok_or_else(|| ApiError::BadRequest("password required".into()))?;
     let client_id = p.client_id.unwrap_or_else(|| "infinity-cli".into());
 
-    let throttle_key = username.to_lowercase();
-    if let Err(retry) = st.login_throttle.check(&throttle_key) {
-        return Err(ApiError::TooManyRequests(format!("too many attempts; retry in {retry}s")));
+    let registered_client = store::get_client_raw(&st.db, &client_id).await?;
+    if let Some((ref c, _)) = registered_client {
+        if !c.grant_types.iter().any(|g| g == "password") {
+            return Err(ApiError::Unauthorized(
+                "client not permitted for password grant".into(),
+            ));
+        }
     }
 
-    let user = match store::get_user_row_by_email(&st.db, &username).await? {
+    let email = username.trim();
+    let throttle_key = format!("login:{}", email.to_lowercase());
+    if let Err(retry) = st.login_throttle.check(&throttle_key) {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many attempts; retry in {retry}s"
+        )));
+    }
+
+    if password.len() > 4096 {
+        st.login_throttle.record_failure(&throttle_key);
+        return Err(ApiError::Unauthorized("invalid credentials".into()));
+    }
+
+    let user = match store::get_user_row_by_email(&st.db, email).await? {
         Some(u) => u,
         None => {
             // Equalize timing so absent accounts are indistinguishable.
@@ -411,6 +599,7 @@ async fn grant_password(st: &SharedState, p: TokenParams) -> ApiResult<Json<serd
     // Disabled check only after successful password verification (avoids
     // pre-auth account-status enumeration).
     if user.disabled != 0 {
+        st.login_throttle.record_failure(&throttle_key);
         return Err(ApiError::Forbidden("account disabled".into()));
     }
     if user.mfa_enabled != 0 {
@@ -423,14 +612,34 @@ async fn grant_password(st: &SharedState, p: TokenParams) -> ApiResult<Json<serd
     // Password grant is a trusted first-party flow: audience is the issuer, and
     // only standard OIDC scopes (or the named client's registered scopes) are
     // granted — callers cannot self-assert arbitrary resource scopes.
-    let allowed = match store::get_client_raw(&st.db, &client_id).await? {
+    let allowed = match registered_client {
         Some((c, _)) => c.scopes,
         None => Vec::new(),
     };
-    let requested = p.scope.unwrap_or_else(|| "openid profile email offline_access".into());
+    let requested = p
+        .scope
+        .unwrap_or_else(|| "openid profile email offline_access".into());
     let scope = narrow_scope(&requested, &allowed);
-    let body = token_response(st, &user.id, Some(&user.username), &st.config.issuer, &client_id, &scope, true).await?;
-    store::audit(&st.db, &user.id, "token.issue", Some(&client_id), None, Some("password")).await;
+    let body = token_response(
+        st,
+        &user.id,
+        Some(&user.username),
+        &st.config.issuer,
+        &client_id,
+        &scope,
+        true,
+        None,
+    )
+    .await?;
+    store::audit(
+        &st.db,
+        &user.id,
+        "token.issue",
+        Some(&client_id),
+        None,
+        Some("password"),
+    )
+    .await;
     Ok(Json(body))
 }
 
@@ -440,27 +649,48 @@ pub async fn verify_second_factor(
     user: &store::UserRow,
     otp: Option<&str>,
 ) -> ApiResult<()> {
+    let mfa_key = format!("mfa:{}", user.id);
+    if let Err(retry) = st.login_throttle.check(&mfa_key) {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many MFA attempts; retry in {retry}s"
+        )));
+    }
     let otp = otp.ok_or(ApiError::Unauthorized("mfa_required".into()))?;
     let secret = user
         .mfa_secret
         .as_deref()
         .ok_or_else(|| ApiError::Internal("mfa enabled without secret".into()))?;
     // Enforce one-time use: only accept a TOTP step newer than the last one
-    // consumed, then advance the high-water mark so the code cannot be replayed.
-    let min_step = user.mfa_last_step.map(|s| s.saturating_add(1) as u64).unwrap_or(0);
-    if let Some(step) =
-        infinity_core::mfa::verify_totp_step(secret, otp, &st.config.mfa_issuer, &user.email, min_step)
-            .unwrap_or(None)
+    // consumed, then atomically advance the high-water mark so the code cannot be replayed.
+    let min_step = user
+        .mfa_last_step
+        .and_then(|s| u64::try_from(s).ok())
+        .map(|s| s.saturating_add(1))
+        .unwrap_or(0);
+    if let Some(step) = infinity_core::mfa::verify_totp_step(
+        secret,
+        otp,
+        &st.config.mfa_issuer,
+        &user.email,
+        min_step,
+    )
+    .unwrap_or(None)
     {
-        store::set_mfa_last_step(&st.db, &user.id, step as i64).await?;
-        return Ok(());
+        if store::set_mfa_last_step_atomic(&st.db, &user.id, step as i64).await? {
+            st.login_throttle.record_success(&mfa_key);
+            return Ok(());
+        }
+        st.login_throttle.record_failure_with_threshold(&mfa_key, 5);
+        return Err(ApiError::Unauthorized("invalid mfa code".into()));
     }
     // Fall back to recovery code.
     let hash = infinity_core::mfa::hash_recovery_code(otp);
     if store::consume_recovery_code(&st.db, &user.id, &hash).await? {
+        st.login_throttle.record_success(&mfa_key);
         store::audit(&st.db, &user.id, "mfa.recovery_used", None, None, None).await;
         return Ok(());
     }
+    st.login_throttle.record_failure_with_threshold(&mfa_key, 5);
     Err(ApiError::Unauthorized("invalid mfa code".into()))
 }
 
@@ -473,11 +703,11 @@ pub async fn userinfo(
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
     Ok(Json(json!({
-        "sub": user.id,
-        "email": user.email,
+        "sub": &user.id,
+        "email": &user.email,
         "email_verified": true,
-        "preferred_username": user.username,
-        "name": user.display_name,
+        "preferred_username": &user.username,
+        "name": &user.display_name,
         "roles": principal.roles,
     })))
 }

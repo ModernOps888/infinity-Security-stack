@@ -4,7 +4,10 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use stream_core::bm25::Bm25Index;
+use stream_core::bm25::{
+    Bm25Index, MAX_DOC_TEXT_BYTES, MAX_QUERY_BYTES, MAX_SEARCH_OFFSET, MAX_TOP_K,
+};
+use stream_core::security::{validate_doc_id, validate_resource_name};
 
 use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
@@ -15,12 +18,16 @@ use crate::store;
 pub struct CreateIndex {
     pub name: String,
 }
+
 #[derive(Debug, Deserialize)]
 pub struct SearchQuery {
     pub q: String,
     #[serde(default = "default_k")]
     pub k: usize,
+    #[serde(default)]
+    pub offset: usize,
 }
+
 fn default_k() -> usize {
     10
 }
@@ -31,7 +38,7 @@ pub async fn create(
     Json(req): Json<CreateIndex>,
 ) -> ApiResult<Json<Value>> {
     p.require("search:create")?;
-    validate_name(&req.name)?;
+    validate_resource_name(&req.name)?;
     store::create_index(&st.db, &req.name)
         .await
         .map_err(|e| match e {
@@ -63,8 +70,10 @@ pub async fn delete_index(
     Path(name): Path<String>,
 ) -> ApiResult<Json<Value>> {
     p.require("search:delete")?;
-    validate_name(&name)?;
-    store::delete_index(&st.db, &name).await?;
+    validate_resource_name(&name)?;
+    if !store::delete_index(&st.db, &name).await? {
+        return Err(ApiError::NotFound("index not found".into()));
+    }
     st.indexes.write().await.remove(&name);
     Ok(Json(json!({"ok": true})))
 }
@@ -76,7 +85,7 @@ pub async fn upsert_docs(
     Json(body): Json<Value>,
 ) -> ApiResult<Json<Value>> {
     p.require("search:write")?;
-    validate_name(&name)?;
+    validate_resource_name(&name)?;
     let docs = if let Some(arr) = body.as_array() {
         arr.clone()
     } else if let Some(arr) = body.get("docs").and_then(|v| v.as_array()) {
@@ -92,14 +101,11 @@ pub async fn upsert_docs(
             st.config.max_search_docs_per_batch
         )));
     }
-    if !st.indexes.read().await.contains_key(&name) {
-        return Err(ApiError::NotFound("index not found".into()));
-    }
-    let mut indexed = 0usize;
-    let mut idxs = st.indexes.write().await;
-    let idx = idxs
-        .get_mut(&name)
-        .ok_or_else(|| ApiError::NotFound("index not found".into()))?;
+
+    // Validate all incoming documents (including depth/text limits) before
+    // checking capacity or mutating SQLite / Bm25Index.
+    let mut prepared = Vec::with_capacity(docs.len());
+    let mut db_rows = Vec::with_capacity(docs.len());
     for doc in docs {
         let obj = doc
             .as_object()
@@ -118,9 +124,25 @@ pub async fn upsert_docs(
         }
         let json_fields =
             serde_json::to_string(&fields).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        store::upsert_doc(&st.db, &name, &id, &json_fields).await?;
-        idx.index(id, fields);
-        indexed += 1;
+        if json_fields.len() > MAX_DOC_TEXT_BYTES {
+            return Err(ApiError::BadRequest(format!(
+                "document fields exceed max size of {MAX_DOC_TEXT_BYTES} bytes"
+            )));
+        }
+        let prepared_doc = Bm25Index::prepare_doc(id.clone(), fields)?;
+        prepared.push(prepared_doc);
+        db_rows.push((id, json_fields));
+    }
+
+    let mut idxs = st.indexes.write().await;
+    let idx = idxs
+        .get_mut(&name)
+        .ok_or_else(|| ApiError::NotFound("index not found".into()))?;
+    idx.check_batch_capacity(&prepared)?;
+    store::upsert_docs_batch(&st.db, &name, &db_rows).await?;
+    let indexed = prepared.len();
+    for doc in prepared {
+        idx.commit_prepared(doc);
     }
     Ok(Json(json!({"indexed": indexed})))
 }
@@ -132,53 +154,34 @@ pub async fn query(
     Query(q): Query<SearchQuery>,
 ) -> ApiResult<Json<Value>> {
     p.require("search:query")?;
-    validate_name(&name)?;
-    if q.q.len() > 512 {
+    validate_resource_name(&name)?;
+    if q.q.len() > MAX_QUERY_BYTES {
         return Err(ApiError::BadRequest("query too long".into()));
+    }
+    if q.k == 0 || q.k > MAX_TOP_K {
+        return Err(ApiError::BadRequest(format!("k must be 1..={MAX_TOP_K}")));
+    }
+    if q.offset > MAX_SEARCH_OFFSET {
+        return Err(ApiError::BadRequest(format!(
+            "offset must be 0..={MAX_SEARCH_OFFSET}"
+        )));
     }
     let hits = {
         let idxs = st.indexes.read().await;
         let idx = idxs
             .get(&name)
             .ok_or_else(|| ApiError::NotFound("index not found".into()))?;
-        idx.search(&q.q, q.k.min(100))
+        idx.search_with_offset(&q.q, q.k, q.offset)?
     };
     let mut out = Vec::new();
     for hit in hits {
+        if !hit.score.is_finite() {
+            continue;
+        }
         if let Some(fields_json) = store::doc_fields(&st.db, &name, &hit.doc_id).await? {
             let fields: Value = serde_json::from_str(&fields_json).unwrap_or_else(|_| json!({}));
             out.push(json!({"id": hit.doc_id, "score": hit.score, "fields": fields}));
         }
     }
     Ok(Json(json!({"query": q.q, "hits": out})))
-}
-
-fn validate_name(name: &str) -> ApiResult<()> {
-    let ok = !name.is_empty()
-        && name.len() <= 128
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-    if ok {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest(
-            "name must be 1-128 chars of [A-Za-z0-9_-]".into(),
-        ))
-    }
-}
-
-fn validate_doc_id(id: &str) -> ApiResult<()> {
-    let ok = !id.is_empty()
-        && id.len() <= 256
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == ':');
-    if ok {
-        Ok(())
-    } else {
-        Err(ApiError::BadRequest(
-            "doc.id must be 1-256 chars of [A-Za-z0-9_.:-]".into(),
-        ))
-    }
 }

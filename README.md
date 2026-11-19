@@ -6,9 +6,9 @@
 
 Predictable performance. Memory safety. No GC pauses. Self-hostable. No per-seat tax.
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./infinity-id/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-000000?logo=rust)](https://www.rust-lang.org/)
-[![CI](https://github.com/ModernOps888/infinity-stack/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernOps888/infinity-stack/actions/workflows/ci.yml)
+[![CI](https://github.com/ModernOps888/infinity-Security-stack/actions/workflows/ci.yml/badge.svg)](https://github.com/ModernOps888/infinity-Security-stack/actions/workflows/ci.yml)
 
 </div>
 
@@ -25,7 +25,11 @@ Rust's memory safety, C-like performance, and lack of garbage collection (predic
 | [Infinity Data](./infinity-data/) | Snowflake · Databricks · Pinecone | 🟢 Runnable · hardened (alpha) |
 | [Infinity Stream](./infinity-stream/) | Kafka/Confluent · Elasticsearch · Algolia | 🟢 Runnable · hardened (alpha) |
 
-Every service ships hardened by default — Argon2id password storage, opaque server-side sessions with `HttpOnly`/`SameSite=Strict` (+ `Secure`) cookies and a 2-hour default TTL, RBAC, O(1) indexed API-key auth with constant-time confirmation, per-account lockout + per-IP rate limiting (memory-bounded), hardened HTTP security headers, and fully parameterized SQL. Each tool has passed automated security review with findings remediated and verified — most recently a 4th round that upgraded `sqlx` 0.7 → 0.8 across all four workspaces (clearing several transitive rustls/webpki advisories and a yanked `spin` dependency) and removed the unused `rsa` dependency from Observe, Data and Stream; ID keeps `rsa` for JWKS key generation and documents the one remaining advisory as an accepted, monitored risk. This round also added a GitHub Actions CI matrix (check/test/clippy/audit per service) and, for Infinity ID, signing-key rotation so a manual JWKS rotation never invalidates a live session or access token.
+Every service ships hardened by default — Argon2id (`19 MiB, t=2, p=1`) password storage with weak/placeholder bootstrap password rejection (CSPRNG generation when unset), opaque server-side sessions with `HttpOnly`/`SameSite=Strict` (+ `Secure` on HTTPS / off loopback) cookies, anti-fixation session rotation, and a **2-hour default TTL (`7200s`)**, strict `resource:action` RBAC, O(1) indexed SHA-256 API-key auth with constant-time confirmation in Observe/Data/Stream (and RS256 JWTs + constant-time hashed client secrets in Infinity ID), memory-bounded per-account lockout + per-IP rate limiting (with `trusted_proxies` `X-Forwarded-For` boundaries), CSRF `Origin`/`Sec-Fetch-Site` guards, hardened HTTP security headers (strict CSP without `'unsafe-inline'`, HSTS, `DENY`, `nosniff`, `Cache-Control: no-store`), and parameterized `sqlx` SQL.
+
+All four workspaces are upgraded to `sqlx` `0.9` (`libsqlite3-sys >= 0.39.0`, fixing `RUSTSEC-2026-0459`), `Infinity ID` uses `rsa` `0.10` (`RUSTSEC-2023-0071` resolved) with `0600` key persistence and live JWKS rotation, and `Observe`/`Data`/`Stream` carry zero `rsa` dependencies in `Cargo.lock`. Every service's `.cargo/audit.toml` specifies `ignore = []` with **0 active CVEs and 0 ignored CVEs** in `cargo audit` (one informational `unmaintained` warning, `RUSTSEC-2026-0543` on `chrono` `0.4`, is tracked in [`SECURITY.md`](./SECURITY.md)). GitHub Actions CI enforces `cargo fmt --check`, `cargo check`, `cargo test`, `cargo clippy -- -D warnings`, `cargo audit`, and automated PII/secret/BOM/action-pin hygiene checks across all four workspaces.
+
+See [`SECURITY.md`](./SECURITY.md) for the security architecture summary, vulnerability disclosure policy, and dependency audit ledger.
 
 ---
 
@@ -37,7 +41,7 @@ A secure-by-design IAM platform in a single fast binary: **OpenID Connect, OAuth
 
 ```bash
 cd infinity-id
-INFINITY_ADMIN_PASSWORD='ChooseAStrongOne#2025' cargo run --bin infinity-id
+INFINITY_ADMIN_PASSWORD="$(openssl rand -base64 24)" cargo run --bin infinity-id
 # open http://localhost:8080
 ```
 
@@ -55,7 +59,7 @@ INFINITY_ADMIN_PASSWORD='ChooseAStrongOne#2025' cargo run --bin infinity-id
 ## Repository layout
 
 ```
-infinity-stack/
+infinity-Security-stack/
 ├─ infinity-id/         # identity + OAuth2/OIDC + edge gateway + dashboard (flagship)
 ├─ infinity-observe/    # observability — logs, metrics, traces, alerts + dashboard
 ├─ infinity-data/       # vector DB + analytics tables + dashboard
@@ -64,4 +68,4 @@ infinity-stack/
 
 ## License
 
-[Apache-2.0](./infinity-id/LICENSE) © Infinity Stack.
+[Apache-2.0](./LICENSE) © Infinity Stack.

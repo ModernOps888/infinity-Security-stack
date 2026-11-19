@@ -1,16 +1,38 @@
-use axum::extract::State;
-use axum::http::header::SET_COOKIE;
+use axum::extract::{FromRequestParts, State};
+use axum::http::header::{CACHE_CONTROL, PRAGMA, SET_COOKIE};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
+use url::{Host, Url};
 
-use crate::auth::{Principal, SESSION_COOKIE};
+use crate::auth::{bearer, cookie_value, Principal, SESSION_COOKIE};
 use crate::error::{ApiError, ApiResult};
 use crate::state::SharedState;
 use crate::store;
 use crate::util::{random_token, sha256_hex};
+
+#[derive(Debug, Clone)]
+pub struct ClientIp(pub String);
+
+#[axum::async_trait]
+impl FromRequestParts<SharedState> for ClientIp {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &SharedState,
+    ) -> Result<Self, Self::Rejection> {
+        let ip = parts
+            .extensions
+            .get::<ClientIp>()
+            .map(|c| c.0.clone())
+            .unwrap_or_else(|| "unknown".into());
+        Ok(ClientIp(ip))
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
@@ -28,17 +50,31 @@ fn session_cookie(token: &str, ttl: i64, secure: bool) -> String {
     }
 }
 
-fn clear_session_cookie(secure: bool) -> &'static str {
+fn clear_session_cookie(secure: bool) -> String {
+    let base = format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0");
     if secure {
-        "infinity_observe_session=; HttpOnly; SameSite=Strict; Secure; Path=/; Max-Age=0"
+        format!("{base}; Secure")
     } else {
-        "infinity_observe_session=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"
+        base
     }
 }
 
+/// Only omit `Secure` for explicit local loopback HTTP (`http://localhost`,
+/// `http://127.0.0.0/8`, `http://[::1]`). Any other host or `https://` sets `Secure`.
 fn use_secure_cookie(st: &SharedState) -> bool {
-    let public_url = &st.config.public_url;
-    !(public_url.starts_with("http://localhost") || public_url.starts_with("http://127."))
+    let Ok(url) = Url::parse(&st.config.public_url) else {
+        return true;
+    };
+    if url.scheme() != "http" {
+        return true;
+    }
+    let is_loopback = match url.host() {
+        Some(Host::Domain(d)) => d.eq_ignore_ascii_case("localhost"),
+        Some(Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    !is_loopback
 }
 
 fn cookie_from_headers(headers: &HeaderMap) -> Option<String> {
@@ -49,17 +85,58 @@ fn cookie_from_headers(headers: &HeaderMap) -> Option<String> {
         .split(';')
         .find_map(|kv| {
             let (k, v) = kv.trim().split_once('=')?;
-            (k == SESSION_COOKIE).then(|| v.to_string())
+            (k == SESSION_COOKIE).then(|| v.trim().to_string())
         })
+}
+
+fn attach_no_store(headers: &mut HeaderMap) {
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(PRAGMA, HeaderValue::from_static("no-cache"));
+}
+
+pub struct AuthExtract(pub Option<String>);
+
+#[axum::async_trait]
+impl FromRequestParts<SharedState> for AuthExtract {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &SharedState,
+    ) -> Result<Self, Self::Rejection> {
+        let tok = if parts
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+        {
+            bearer(parts)
+        } else {
+            cookie_value(parts, SESSION_COOKIE)
+        };
+        Ok(AuthExtract(tok))
+    }
 }
 
 pub async fn login(
     State(st): State<SharedState>,
+    ClientIp(client_ip): ClientIp,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Response> {
+    if let Err(retry) = st.login_throttle.check_ip(&client_ip) {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many attempts; retry in {retry}s"
+        )));
+    }
+
     let email = req.email.trim().to_lowercase();
     if email.is_empty() || email.len() > 254 || req.password.len() > 1024 {
-        observe_core::password::dummy_verify(&req.password);
+        let safe_pw = if req.password.len() <= 1024 {
+            &req.password
+        } else {
+            ""
+        };
+        observe_core::password::dummy_verify(safe_pw);
+        st.login_throttle.record_ip_failure(&client_ip);
         return Err(ApiError::Unauthorized("invalid credentials".into()));
     }
 
@@ -74,17 +151,29 @@ pub async fn login(
         None => {
             observe_core::password::dummy_verify(&req.password);
             st.login_throttle.record_failure(&email);
+            st.login_throttle.record_ip_failure(&client_ip);
             return Err(ApiError::Unauthorized("invalid credentials".into()));
         }
     };
     if !observe_core::password::verify_password(&req.password, &user.password_hash)? {
         st.login_throttle.record_failure(&email);
+        st.login_throttle.record_ip_failure(&client_ip);
         return Err(ApiError::Unauthorized("invalid credentials".into()));
     }
     if user.disabled != 0 {
+        st.login_throttle.record_failure(&email);
+        st.login_throttle.record_ip_failure(&client_ip);
         return Err(ApiError::Unauthorized("invalid credentials".into()));
     }
     st.login_throttle.record_success(&email);
+    st.login_throttle.record_ip_success(&client_ip);
+
+    // Session fixation defense: invalidate any pre-existing session cookie on re-auth.
+    if let Some(old_session) = cookie_from_headers(&headers) {
+        if !old_session.is_empty() {
+            let _ = store::delete_session(&st.db, &sha256_hex(&old_session)).await;
+        }
+    }
 
     let session = random_token();
     store::create_session(
@@ -115,30 +204,36 @@ pub async fn login(
         ))
         .map_err(|e| ApiError::Internal(e.to_string()))?,
     );
+    attach_no_store(resp.headers_mut());
     Ok(resp)
 }
 
 pub async fn logout(
     State(st): State<SharedState>,
-    headers: HeaderMap,
+    AuthExtract(tok): AuthExtract,
     principal: Principal,
 ) -> ApiResult<Response> {
-    if let Some(raw) = cookie_from_headers(&headers) {
+    if let Some(raw) = tok {
         store::delete_session(&st.db, &sha256_hex(&raw)).await?;
     }
     let mut resp = Json(json!({ "ok": true, "user_id": principal.user_id })).into_response();
+    let cleared = clear_session_cookie(use_secure_cookie(&st));
     resp.headers_mut().insert(
         SET_COOKIE,
-        HeaderValue::from_static(clear_session_cookie(use_secure_cookie(&st))),
+        HeaderValue::from_str(&cleared).map_err(|e| ApiError::Internal(e.to_string()))?,
     );
+    attach_no_store(resp.headers_mut());
     Ok(resp)
 }
 
-pub async fn me(principal: Principal) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(json!({
+pub async fn me(principal: Principal) -> ApiResult<Response> {
+    let mut resp = Json(json!({
         "id": principal.user_id,
         "email": principal.email,
         "role": principal.role,
         "permissions": principal.permissions,
-    })))
+    }))
+    .into_response();
+    attach_no_store(resp.headers_mut());
+    Ok(resp)
 }

@@ -6,7 +6,6 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Context;
-use axum::http::{header, HeaderName, HeaderValue, Method};
 use data_core::hnsw::HnswIndex;
 use data_server::config::Config;
 use data_server::ratelimit::IpRateLimiter;
@@ -14,8 +13,6 @@ use data_server::state::AppState;
 use data_server::throttle::LoginThrottle;
 use data_server::{routes, store};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use tower_http::cors::CorsLayer;
-use tower_http::set_header::SetResponseHeaderLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -26,6 +23,9 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Warm the constant-time dummy Argon2id hash before accepting connections.
+    data_core::password::warm_dummy_hash();
+
     let config = Config::load().context("loading configuration")?;
     std::fs::create_dir_all(&config.data_dir).context("creating data directory")?;
     let collections_dir = std::path::Path::new(&config.data_dir).join("collections");
@@ -35,7 +35,8 @@ async fn main() -> anyhow::Result<()> {
     let opts = SqliteConnectOptions::from_str(&config.database_url)
         .context("parsing database_url")?
         .create_if_missing(true)
-        .foreign_keys(true);
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(5));
     let db = SqlitePoolOptions::new()
         .max_connections(10)
         .connect_with(opts)
@@ -55,8 +56,20 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(collections = indexes.len(), "loaded vector indexes");
 
     let bind = config.bind.clone();
-    let cors = build_cors(&config);
     let global_limit = config.global_rate_limit_per_min;
+    if !config.secure_cookies() && !bind.starts_with("127.0.0.1:") && !bind.starts_with("[::1]:") {
+        tracing::warn!(
+            %bind,
+            public_url = %config.public_url,
+            "serving without Secure cookie flag on non-loopback bind; configure HTTPS public_url behind TLS proxy for production"
+        );
+    }
+    tracing::info!(
+        max_vectors_per_collection = config.max_vectors_per_collection,
+        max_rows_per_table = config.max_rows_per_table,
+        trusted_proxies = config.trusted_proxies.len(),
+        "resource and proxy limits configured"
+    );
     let state = Arc::new(AppState {
         db,
         config,
@@ -69,20 +82,10 @@ async fn main() -> anyhow::Result<()> {
         "global rate limiter configured"
     );
 
-    let app = routes::router(state.clone())
-        .layer(cors)
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static(
-                "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
-            ),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")))
-        .layer(SetResponseHeaderLayer::overriding(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY")))
-        .layer(SetResponseHeaderLayer::overriding(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer")))
-        .layer(SetResponseHeaderLayer::overriding(HeaderName::from_static("permissions-policy"), HeaderValue::from_static("geolocation=(), microphone=(), camera=()")))
-        .layer(SetResponseHeaderLayer::overriding(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=63072000; includeSubDomains")))
-        .layer(TraceLayer::new_for_http());
+    // Security headers (CSP, HSTS, X-Frame-Options, nosniff, etc.), CORS, CSRF Origin
+    // checks, body limits, and IP rate limiting are wired inside `routes::router` so
+    // production and integration tests share the exact same middleware stack.
+    let app = routes::router(state.clone()).layer(TraceLayer::new_for_http());
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -92,9 +95,33 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
     .context("server error")?;
     Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {},
+            _ = async {
+                if let Some(ref mut s) = sigterm {
+                    s.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {},
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    tracing::info!("shutdown signal received");
 }
 
 async fn rebuild_indexes(db: &sqlx::SqlitePool) -> anyhow::Result<HashMap<String, HnswIndex>> {
@@ -107,23 +134,4 @@ async fn rebuild_indexes(db: &sqlx::SqlitePool) -> anyhow::Result<HashMap<String
         indexes.insert(c.name, index);
     }
     Ok(indexes)
-}
-
-fn build_cors(config: &Config) -> CorsLayer {
-    let origins: Vec<HeaderValue> = config
-        .cors_origins
-        .iter()
-        .filter_map(|o| HeaderValue::from_str(o).ok())
-        .collect();
-    CorsLayer::new()
-        .allow_origin(origins)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PATCH,
-            Method::PUT,
-            Method::DELETE,
-        ])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-        .allow_credentials(true)
 }

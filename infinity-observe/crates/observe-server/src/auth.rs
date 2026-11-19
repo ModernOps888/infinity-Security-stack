@@ -7,6 +7,8 @@ use crate::store;
 use crate::util::sha256_hex;
 
 pub const SESSION_COOKIE: &str = "infinity_observe_session";
+const MIN_TOKEN_LEN: usize = 16;
+const MAX_TOKEN_LEN: usize = 512;
 
 #[derive(Debug, Clone)]
 pub struct Principal {
@@ -33,7 +35,12 @@ pub struct IngestAuth {
     pub key_id: String,
 }
 
-fn cookie_value(parts: &Parts, name: &str) -> Option<String> {
+fn valid_token_shape(tok: &str) -> bool {
+    (MIN_TOKEN_LEN..=MAX_TOKEN_LEN).contains(&tok.len())
+        && !tok.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+pub(crate) fn cookie_value(parts: &Parts, name: &str) -> Option<String> {
     let header = parts
         .headers
         .get(axum::http::header::COOKIE)?
@@ -41,18 +48,22 @@ fn cookie_value(parts: &Parts, name: &str) -> Option<String> {
         .ok()?;
     header.split(';').find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
-        (k == name).then(|| v.to_string())
+        let val = v.trim();
+        (k == name && valid_token_shape(val)).then(|| val.to_string())
     })
 }
 
-fn bearer(parts: &Parts) -> Option<String> {
-    parts
+pub(crate) fn bearer(parts: &Parts) -> Option<String> {
+    let mut all = parts
         .headers
-        .get(axum::http::header::AUTHORIZATION)?
-        .to_str()
-        .ok()?
-        .strip_prefix("Bearer ")
-        .map(|s| s.to_string())
+        .get_all(axum::http::header::AUTHORIZATION)
+        .iter();
+    let first = all.next()?;
+    if all.next().is_some() {
+        return None;
+    }
+    let raw = first.to_str().ok()?.strip_prefix("Bearer ")?.trim();
+    valid_token_shape(raw).then(|| raw.to_string())
 }
 
 #[axum::async_trait]
@@ -63,7 +74,15 @@ impl FromRequestParts<SharedState> for Principal {
         parts: &mut Parts,
         state: &SharedState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(tok) = bearer(parts).or_else(|| cookie_value(parts, SESSION_COOKIE)) {
+        let tok = if parts
+            .headers
+            .contains_key(axum::http::header::AUTHORIZATION)
+        {
+            bearer(parts)
+        } else {
+            cookie_value(parts, SESSION_COOKIE)
+        };
+        if let Some(tok) = tok {
             let hash = sha256_hex(&tok);
             if let Some(uid) = store::get_session_user(&state.db, &hash).await? {
                 return resolve(state, &uid).await;
@@ -84,6 +103,9 @@ impl FromRequestParts<SharedState> for IngestAuth {
         let Some(tok) = bearer(parts) else {
             return Err(ApiError::Unauthorized("missing bearer ingest key".into()));
         };
+        if !tok.starts_with("io_") {
+            return Err(ApiError::Unauthorized("invalid ingest key".into()));
+        }
         let hash = sha256_hex(&tok);
         match store::validate_ingest_key(&state.db, &hash).await? {
             Some(id) => Ok(IngestAuth { key_id: id }),

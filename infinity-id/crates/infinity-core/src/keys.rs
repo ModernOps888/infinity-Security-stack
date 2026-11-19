@@ -12,13 +12,17 @@
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use rand::RngCore;
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, LineEnding};
+use rsa::rand_core::{TryCryptoRng, TryRng};
 use rsa::traits::PublicKeyParts;
-use rsa::{RsaPrivateKey, RsaPublicKey};
+use rsa::PrivateKey;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use zeroize::Zeroize;
 
 use crate::error::{CoreError, Result};
 
@@ -47,35 +51,98 @@ pub struct SigningKey {
     pub jwk: Jwk,
 }
 
+impl Drop for SigningKey {
+    fn drop(&mut self) {
+        self.private_pem.zeroize();
+    }
+}
+
+fn ensure_private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn harden_private_file_perms(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
+fn write_private_pem(path: &Path, pem: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_private_dir(parent)?;
+    }
+    let tmp_name = format!(
+        ".{}.tmp-{}",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("key"),
+        uuid::Uuid::new_v4()
+    );
+    let tmp_path = path.with_file_name(tmp_name);
+
+    #[cfg(unix)]
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp_path)?
+    };
+    #[cfg(not(unix))]
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&tmp_path)?;
+
+    file.write_all(pem.as_bytes())?;
+    file.sync_all()?;
+    drop(file);
+    harden_private_file_perms(&tmp_path)?;
+    std::fs::rename(&tmp_path, path)?;
+    harden_private_file_perms(path)?;
+    Ok(())
+}
+
 impl SigningKey {
     /// Load an existing key from `path`, or generate + persist a new 2048-bit key.
     pub fn load_or_generate(path: &Path) -> Result<Self> {
         if path.exists() {
+            harden_private_file_perms(path)?;
             let pem = std::fs::read_to_string(path)?;
-            let key = RsaPrivateKey::from_pkcs1_pem(&pem)
+            let key = PrivateKey::from_pkcs1_pem(&pem)
                 .map_err(|e| CoreError::Crypto(format!("parse private key: {e}")))?;
             Self::from_private(key, pem)
         } else {
             let (key, pem) = generate_key()?;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(path, &pem)?;
+            write_private_pem(path, &pem)?;
             Self::from_private(key, pem)
         }
     }
 
-    fn from_private(key: RsaPrivateKey, pem: String) -> Result<Self> {
-        let public = RsaPublicKey::from(&key);
-        let n = public.n().to_bytes_be();
-        let e = public.e().to_bytes_be();
-        let n_b64 = URL_SAFE_NO_PAD.encode(&n);
-        let e_b64 = URL_SAFE_NO_PAD.encode(&e);
+    fn from_private(key: PrivateKey, pem: String) -> Result<Self> {
+        let n_raw = key.n_bytes();
+        let e_raw = key.e_bytes();
+        let n = trim_leading_zeros(&n_raw);
+        let e = trim_leading_zeros(&e_raw);
+        let n_b64 = URL_SAFE_NO_PAD.encode(n);
+        let e_b64 = URL_SAFE_NO_PAD.encode(e);
 
         // Stable key id = URL-safe base64 of SHA-256(n || e).
         let mut hasher = Sha256::new();
-        hasher.update(&n);
-        hasher.update(&e);
+        hasher.update(n);
+        hasher.update(e);
         let kid = URL_SAFE_NO_PAD.encode(hasher.finalize())[..16].to_string();
 
         let jwk = Jwk {
@@ -86,18 +153,54 @@ impl SigningKey {
             n: n_b64,
             e: e_b64,
         };
-        Ok(Self { kid, private_pem: pem, jwk })
+        Ok(Self {
+            kid,
+            private_pem: pem,
+            jwk,
+        })
     }
 
     /// Publish the public key as a single-entry JWKS document.
     pub fn jwks(&self) -> Jwks {
-        Jwks { keys: vec![self.jwk.clone()] }
+        Jwks {
+            keys: vec![self.jwk.clone()],
+        }
     }
 }
 
-fn generate_key() -> Result<(RsaPrivateKey, String)> {
-    let mut rng = rand::thread_rng();
-    let key = RsaPrivateKey::new(&mut rng, 2048)
+/// RFC 7518 §6.3.1 Base64urlUInt: big-endian unsigned integer with no leading zero octets
+/// (except a single 0x00 if the value itself were zero).
+fn trim_leading_zeros(bytes: &[u8]) -> &[u8] {
+    let first_nonzero = bytes.iter().position(|&b| b != 0);
+    match first_nonzero {
+        Some(idx) => &bytes[idx..],
+        None => &bytes[bytes.len().saturating_sub(1)..],
+    }
+}
+
+struct CoreOsRng;
+
+impl TryRng for CoreOsRng {
+    type Error = rand::Error;
+
+    fn try_next_u32(&mut self) -> std::result::Result<u32, Self::Error> {
+        rsa::rand_core::utils::next_word_via_fill(self)
+    }
+
+    fn try_next_u64(&mut self) -> std::result::Result<u64, Self::Error> {
+        rsa::rand_core::utils::next_word_via_fill(self)
+    }
+
+    fn try_fill_bytes(&mut self, dst: &mut [u8]) -> std::result::Result<(), Self::Error> {
+        rand::rngs::OsRng.try_fill_bytes(dst)
+    }
+}
+
+impl TryCryptoRng for CoreOsRng {}
+
+fn generate_key() -> Result<(PrivateKey, String)> {
+    let mut rng = CoreOsRng;
+    let key = PrivateKey::new(&mut rng, 2048)
         .map_err(|e| CoreError::Crypto(format!("generate key: {e}")))?;
     let pem = key
         .to_pkcs1_pem(LineEnding::LF)
@@ -113,15 +216,24 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
-/// Retired-key filename convention: `<stem>.retired-<unix_ts>.<ext>`, stored
-/// alongside the active key file so a restart rediscovers them.
-fn retired_file_name(stem: &str, ext: &str, retired_at: i64) -> String {
-    format!("{stem}.retired-{retired_at}.{ext}")
+/// Retired-key filename convention: `<stem>.retired-<unix_ts>-<kid>.<ext>`
+/// (also reads legacy `<stem>.retired-<unix_ts>.<ext>`), stored alongside the
+/// active key file so a restart rediscovers them without same-second collisions.
+fn retired_file_name(stem: &str, ext: &str, retired_at: i64, kid: &str) -> String {
+    format!("{stem}.retired-{retired_at}-{kid}.{ext}")
 }
 
 fn split_stem_ext(path: &Path) -> (String, String) {
-    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("signing_key").to_string();
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("pem").to_string();
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("signing_key")
+        .to_string();
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("pem")
+        .to_string();
     (stem, ext)
 }
 
@@ -147,26 +259,44 @@ impl KeyRing {
 
     fn load_previous(path: &Path, retention_secs: i64) -> Result<Vec<SigningKey>> {
         let mut previous: Vec<(i64, SigningKey)> = Vec::new();
-        let Some(dir) = path.parent() else { return Ok(Vec::new()) };
+        let Some(dir) = path.parent() else {
+            return Ok(Vec::new());
+        };
         let (stem, ext) = split_stem_ext(path);
         let prefix = format!("{stem}.retired-");
         let suffix = format!(".{ext}");
         let now = now_unix();
 
-        let Ok(entries) = std::fs::read_dir(dir) else { return Ok(Vec::new()) };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(Vec::new());
+        };
         for entry in entries.flatten() {
             let file_name = entry.file_name();
             let file_name = file_name.to_string_lossy();
-            let Some(rest) = file_name.strip_prefix(&prefix) else { continue };
-            let Some(ts_str) = rest.strip_suffix(&suffix) else { continue };
-            let Ok(retired_at) = ts_str.parse::<i64>() else { continue };
+            let Some(rest) = file_name.strip_prefix(&prefix) else {
+                continue;
+            };
+            let Some(ts_and_kid) = rest.strip_suffix(&suffix) else {
+                continue;
+            };
+            let Some(ts_str) = ts_and_kid.split('-').next() else {
+                continue;
+            };
+            let Ok(retired_at) = ts_str.parse::<i64>() else {
+                continue;
+            };
 
-            if now - retired_at > retention_secs {
+            if now.saturating_sub(retired_at) > retention_secs {
                 let _ = std::fs::remove_file(entry.path());
                 continue;
             }
-            let Ok(pem) = std::fs::read_to_string(entry.path()) else { continue };
-            let Ok(key) = RsaPrivateKey::from_pkcs1_pem(&pem) else { continue };
+            let _ = harden_private_file_perms(&entry.path());
+            let Ok(pem) = std::fs::read_to_string(entry.path()) else {
+                continue;
+            };
+            let Ok(key) = PrivateKey::from_pkcs1_pem(&pem) else {
+                continue;
+            };
             if let Ok(signing_key) = SigningKey::from_private(key, pem) {
                 previous.push((retired_at, signing_key));
             }
@@ -174,6 +304,8 @@ impl KeyRing {
         // Newest retirement first, so `jwks()`/verification checks the most
         // recently active keys before older ones.
         previous.sort_by_key(|(retired_at, _)| std::cmp::Reverse(*retired_at));
+        let mut seen_kids = std::collections::HashSet::new();
+        previous.retain(|(_, k)| seen_kids.insert(k.kid.clone()));
         Ok(previous.into_iter().map(|(_, k)| k).collect())
     }
 
@@ -183,13 +315,14 @@ impl KeyRing {
     pub fn rotate(&mut self, path: &Path, retention_secs: i64) -> Result<()> {
         let (stem, ext) = split_stem_ext(path);
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-            let retired_path = dir.join(retired_file_name(&stem, &ext, now_unix()));
-            std::fs::write(&retired_path, &self.active.private_pem)?;
+            ensure_private_dir(dir)?;
+            let retired_path =
+                dir.join(retired_file_name(&stem, &ext, now_unix(), &self.active.kid));
+            write_private_pem(&retired_path, &self.active.private_pem)?;
         }
 
         let (key, pem) = generate_key()?;
-        std::fs::write(path, &pem)?;
+        write_private_pem(path, &pem)?;
         self.active = SigningKey::from_private(key, pem)?;
         // Reload from disk, which picks up the file just written above and
         // prunes anything already past `retention_secs`.
@@ -232,9 +365,15 @@ mod tests {
 
         ring.rotate(&path, 3600).unwrap();
 
-        assert_ne!(ring.active.kid, old_kid, "rotation must generate a fresh active key");
+        assert_ne!(
+            ring.active.kid, old_kid,
+            "rotation must generate a fresh active key"
+        );
         assert_eq!(ring.previous.len(), 1);
-        assert_eq!(ring.previous[0].kid, old_kid, "the retired key must still be published");
+        assert_eq!(
+            ring.previous[0].kid, old_kid,
+            "the retired key must still be published"
+        );
 
         // Both keys must appear in the JWKS and in the local verification set.
         let kids: Vec<_> = ring.jwks().keys.into_iter().map(|k| k.kid).collect();
@@ -249,7 +388,10 @@ mod tests {
         let path = temp_key_path();
         let first = KeyRing::load_or_generate(&path, 3600).unwrap();
         let second = KeyRing::load_or_generate(&path, 3600).unwrap();
-        assert_eq!(first.active.kid, second.active.kid, "restart must reuse the persisted key");
+        assert_eq!(
+            first.active.kid, second.active.kid,
+            "restart must reuse the persisted key"
+        );
 
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
@@ -273,9 +415,51 @@ mod tests {
         std::fs::rename(old_entry.path(), dir.join(stale_name)).unwrap();
 
         let reloaded = KeyRing::load_or_generate(&path, 3600).unwrap();
-        assert!(reloaded.previous.is_empty(), "keys past retention must be pruned on load");
-        assert!(!dir.join(stale_name).exists(), "pruned key file must be deleted from disk");
+        assert!(
+            reloaded.previous.is_empty(),
+            "keys past retention must be pruned on load"
+        );
+        assert!(
+            !dir.join(stale_name).exists(),
+            "pruned key file must be deleted from disk"
+        );
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn rapid_double_rotation_preserves_both_retired_keys() {
+        let path = temp_key_path();
+        let mut ring = KeyRing::load_or_generate(&path, 3600).unwrap();
+        let kid1 = ring.active.kid.clone();
+        ring.rotate(&path, 3600).unwrap();
+        let kid2 = ring.active.kid.clone();
+        ring.rotate(&path, 3600).unwrap();
+        let kid3 = ring.active.kid.clone();
+
+        assert_ne!(kid1, kid2);
+        assert_ne!(kid2, kid3);
+        let kids: Vec<_> = ring.jwks().keys.into_iter().map(|k| k.kid).collect();
+        assert!(kids.contains(&kid1));
+        assert!(kids.contains(&kid2));
+        assert!(kids.contains(&kid3));
+
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_key_files_are_created_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = temp_key_path();
+        let mut ring = KeyRing::load_or_generate(&path, 3600).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        ring.rotate(&path, 3600).unwrap();
+        for entry in std::fs::read_dir(path.parent().unwrap()).unwrap().flatten() {
+            let m = entry.metadata().unwrap().permissions().mode() & 0o777;
+            assert_eq!(m, 0o600);
+        }
+        std::fs::remove_dir_all(path.parent().unwrap()).ok();
     }
 }

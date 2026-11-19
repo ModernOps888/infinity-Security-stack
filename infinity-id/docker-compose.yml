@@ -14,13 +14,27 @@ services:
       RUST_LOG: "info,sqlx=warn"
     volumes:
       - infinity-data:/data
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=16m
+    healthcheck:
+      test: ["CMD", "infinity-id", "--healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
   infinity-edge:
     image: infinity-stack/infinity-id:0.1.0
     command: ["infinity-edge"]
     depends_on:
-      - infinity-id
+      infinity-id:
+        condition: service_healthy
     ports:
       - "9000:9000"
     environment:
@@ -31,6 +45,19 @@ services:
     # Mount an Edge.toml to declare upstream routes:
     # volumes:
     #   - ./Edge.toml:/app/Edge.toml:ro
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=16m
+    healthcheck:
+      test: ["CMD", "infinity-edge", "--healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: unless-stopped
 
 volumes:

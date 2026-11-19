@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -25,17 +28,21 @@ jobs:
       run:
         working-directory: ${{ matrix.service }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
         with:
-          components: clippy
+          toolchain: stable
+          components: clippy, rustfmt
 
       - name: Cache cargo registry and build artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: ${{ matrix.service }}
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
 
       - name: cargo check
         run: cargo check --workspace --all-targets
@@ -47,7 +54,116 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo audit
-        uses: rustsec/audit-check@v2.0.0
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           working-directory: ${{ matrix.service }}
+
+  hygiene:
+    name: repo-hygiene / PII, secret, BOM & action-pin scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Scan tracked files for PII, secrets, BOMs, PNG metadata, and pinned Actions
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import re
+          import struct
+          import subprocess
+          import sys
+          from pathlib import Path
+
+          files = subprocess.check_output(["git", "ls-files"]).decode("utf-8").splitlines()
+          errors = []
+
+          secret_pats = [
+              ("private-key", re.compile(r"-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----")),
+              ("github-token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b")),
+              ("aws-key", re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b")),
+              ("google-api-key", re.compile(r"\bAIza[0-9A-Za-z\-_]{35}\b")),
+              ("sk-token", re.compile(r"\bsk-(?:proj-|ant-|live_)[A-Za-z0-9\-_]{16,}\b")),
+              ("slack-token", re.compile(r"\bxox[baprs]-[0-9A-Za-z\-]{10,}\b")),
+              ("jwt-literal", re.compile(r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b")),
+              ("local-path", re.compile(r"(?:[A-Za-z]:[/\\]{1,2}Users[/\\]{1,2}|/Users/|/home/)[A-Za-z0-9._-]+", re.I)),
+              ("stale-repo-url", re.compile(r"(?:https://example\.com/infinity" r"-stack|ModernOps888/infinity" r"-stack)")),
+          ]
+          blocked_token_hashes = {
+              "f31c6c10ac73b851eeea0e9d170b1f159e4af5e98de4097463f9ca0127ddcf80",
+              "9bf1111bf89d7d83faee73e3f682efc4b3074d97e9badf2476c036fc898adc98",
+          }
+          token_re = re.compile(r"[a-z0-9]{4,}")
+          stale_pw_re = re.compile(r"ChangeMe_Infinity#" r"2025|ChooseAStrongOne#" r"2025")
+          url_re = re.compile(r"https?://[^\s\"'<>`]+")
+          email_re = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}")
+          allowed_domain_re = re.compile(
+              r"@(?:users\.noreply\.github\.com|(?:[A-Za-z0-9-]+\.)*(?:example\.(?:com|org|net|test)|example|test|invalid|localhost)|infinity\.local)$"
+          )
+          forbidden_paths = (".pem", ".key", ".db", ".sqlite", ".sqlite3")
+
+          for rel in files:
+              p = Path(rel)
+              name = p.name
+              if (name == ".env" or name.startswith(".env.")) and name != ".env.example":
+                  errors.append(f"forbidden tracked env file: {rel}")
+              if rel.startswith("marketing/") or name.endswith(forbidden_paths):
+                  errors.append(f"forbidden tracked artifact: {rel}")
+
+              data = p.read_bytes()
+              if data.startswith(b"\xef\xbb\xbf"):
+                  errors.append(f"UTF-8 BOM detected: {rel}")
+
+              if p.suffix.lower() == ".png":
+                  pos = 8
+                  while pos + 8 <= len(data):
+                      length = struct.unpack(">I", data[pos:pos + 4])[0]
+                      ctype = data[pos + 4:pos + 8].decode("latin1", errors="replace")
+                      pos += 12 + length
+                      if ctype in ("tEXt", "zTXt", "iTXt", "eXIf", "tIME", "iCCP"):
+                          errors.append(f"PNG metadata chunk {ctype} in {rel}")
+                      if ctype == "IEND":
+                          break
+                  continue
+
+              if b"\x00" in data[:8192]:
+                  continue
+
+              text = data.decode("utf-8", errors="replace")
+              if rel == ".gitleaks.toml":
+                  continue
+
+              in_cfg_test = False
+              for ln, line in enumerate(text.splitlines(), 1):
+                  if p.suffix == ".rs" and "#[cfg(test)]" in line:
+                      in_cfg_test = True
+                  for label, pat in secret_pats:
+                      if pat.search(line):
+                          errors.append(f"{label} in {rel}:{ln}")
+                  for tok in token_re.findall(line.lower()):
+                      if hashlib.sha256(tok.encode("utf-8")).hexdigest() in blocked_token_hashes:
+                          errors.append(f"blocked-internal-token in {rel}:{ln}")
+                  if (p.suffix in (".md", ".toml", ".yml", ".yaml") or name.startswith(".env") or (name == "config.rs" and not in_cfg_test)):
+                      if stale_pw_re.search(line):
+                          errors.append(f"stale-2025-password in {rel}:{ln}")
+                  line_no_urls = url_re.sub(" ", line)
+                  for m in email_re.finditer(line_no_urls):
+                      em = m.group(0).lower()
+                      if not allowed_domain_re.search(em):
+                          errors.append(f"non-allowlisted email {em} in {rel}:{ln}")
+
+              if rel.startswith(".github/workflows/") and p.suffix in (".yml", ".yaml"):
+                  for ln, line in enumerate(text.splitlines(), 1):
+                      m = re.search(r"^\s*-?\s*uses:\s*([^\s#]+)", line)
+                      if m:
+                          ref = m.group(1)
+                          if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*@[0-9a-f]{40}$", ref):
+                              errors.append(f"unpinned GitHub Action {ref!r} in {rel}:{ln}")
+
+          if errors:
+              for e in errors:
+                  print(f"::error::{e}")
+              sys.exit(1)
+          print(f"Hygiene check passed across {len(files)} tracked files.")
+          PY

@@ -1,0 +1,36 @@
+title = "Infinity Security Stack gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "local-user-filesystem-path"
+description = "Detect leaked local developer filesystem paths"
+regex = '''(?i)(?:[A-Za-z]:[/\\]{1,2}Users[/\\]{1,2}|/Users/|/home/)[A-Za-z0-9._-]+'''
+tags = ["pii", "path"]
+
+[[rules]]
+id = "stale-placeholder-password"
+description = "Detect stale default or 2025 placeholder passwords outside rejection denylists/tests"
+regex = '''(?i)(?:ChangeMe_Infinity#2025|ChooseAStrongOne#2025|change-me-to-a-long-random-value)'''
+tags = ["hygiene", "password"]
+
+[rules.allowlist]
+paths = [
+  '''/password\.rs$''',
+  '''/tests/security\.rs$''',
+  '''infinity-id/\.env\.example$''',
+  '''infinity-id/crates/infinity-server/src/config\.rs$''',
+  '''infinity-stream/crates/stream-server/src/config\.rs$''',
+]
+
+[allowlist]
+description = "Allow RFC2606 / local test identities, documented placeholder patterns, and character alphabets"
+paths = [
+  '''(^|/)Cargo\.lock$''',
+  '''^\.gitleaks\.toml$''',
+]
+regexes = [
+  '''[A-Za-z0-9._%+\-]+@(?:users\.noreply\.github\.com|(?:[A-Za-z0-9-]+\.)*example\.(?:com|org|net|test)|infinity\.local)''',
+  '''abcdefghjkmnpqrstuvwxyz23456789''',
+]

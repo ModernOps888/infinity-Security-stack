@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -12,8 +12,8 @@
     <form id="login-form" class="login-card" autocomplete="on">
       <div class="brand-lg"><span class="infinity">∞</span> Infinity&nbsp;Stream</div>
       <p class="muted">Streaming, realtime fan-out, and BM25 search.</p>
-      <label>Email</label><input id="login-email" type="email" required value="admin@infinity.local" />
-      <label>Password</label><input id="login-password" type="password" required placeholder="••••••••" />
+      <label for="login-email">Email</label><input id="login-email" type="email" autocomplete="email" required value="admin@infinity.local" />
+      <label for="login-password">Password</label><input id="login-password" type="password" autocomplete="current-password" required placeholder="••••••••" />
       <button type="submit" class="btn primary full">Sign in</button>
       <div id="login-error" class="error"></div>
     </form>

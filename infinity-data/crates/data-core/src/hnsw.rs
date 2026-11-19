@@ -1,12 +1,72 @@
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::cmp::Ordering;
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::path::Path;
 
 use crate::error::{CoreError, Result};
 use crate::model::Metric;
+
+pub const MAX_DIM: usize = 4096;
+pub const MAX_M: usize = 128;
+pub const MAX_EF_CONSTRUCTION: usize = 2048;
+pub const MAX_EF_SEARCH: usize = 4096;
+pub const MAX_TOP_K: usize = 1000;
+pub const MAX_POINTS: usize = 100_000;
+pub const MAX_POINT_ID_LEN: usize = 128;
+
+#[derive(Debug, Clone)]
+struct DistNode {
+    dist: f32,
+    id: String,
+}
+
+impl PartialEq for DistNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.dist.to_bits() == other.dist.to_bits() && self.id == other.id
+    }
+}
+
+impl Eq for DistNode {}
+
+impl Ord for DistNode {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist
+            .total_cmp(&other.dist)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for DistNode {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn validate_vector(vector: &[f32], expected_dim: usize, label: &str) -> Result<()> {
+    if vector.len() != expected_dim {
+        return Err(CoreError::Invalid(format!(
+            "{label} dimension {} does not match collection dimension {expected_dim}",
+            vector.len()
+        )));
+    }
+    if vector.iter().any(|v| !v.is_finite()) {
+        return Err(CoreError::Invalid(format!(
+            "{label} must contain only finite numbers"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_point_id(id: &str) -> Result<()> {
+    if id.is_empty() || id.len() > MAX_POINT_ID_LEN || id.chars().any(char::is_control) {
+        return Err(CoreError::Invalid(
+            "point id must be 1-128 non-control characters".into(),
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Point {
@@ -46,14 +106,18 @@ pub struct HnswIndex {
 
 impl HnswIndex {
     pub fn new(dim: usize, metric: Metric, m: usize, ef_construction: usize) -> Result<Self> {
-        if dim == 0 {
-            return Err(CoreError::Invalid("dimension must be > 0".into()));
+        if dim == 0 || dim > MAX_DIM {
+            return Err(CoreError::Invalid(format!(
+                "dimension must be between 1 and {MAX_DIM}"
+            )));
         }
+        let m = m.clamp(2, MAX_M);
+        let ef_construction = ef_construction.clamp(m, MAX_EF_CONSTRUCTION);
         Ok(Self {
             dim,
             metric,
-            m: m.max(2),
-            ef_construction: ef_construction.max(m.max(2)),
+            m,
+            ef_construction,
             max_level: 0,
             entry_point: None,
             nodes: HashMap::new(),
@@ -91,15 +155,48 @@ impl HnswIndex {
 
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = std::fs::read(path)?;
-        Ok(serde_json::from_slice(&bytes)?)
+        let index: Self = serde_json::from_slice(&bytes)?;
+        index.validate_loaded()?;
+        Ok(index)
+    }
+
+    fn validate_loaded(&self) -> Result<()> {
+        if self.dim == 0 || self.dim > MAX_DIM {
+            return Err(CoreError::Invalid("invalid loaded index dimension".into()));
+        }
+        if self.m < 2 || self.m > MAX_M {
+            return Err(CoreError::Invalid("invalid loaded index m".into()));
+        }
+        if self.nodes.len() > MAX_POINTS {
+            return Err(CoreError::Invalid("loaded index exceeds point cap".into()));
+        }
+        if self.nodes.is_empty() != self.entry_point.is_none() {
+            return Err(CoreError::Invalid("corrupted index entry point".into()));
+        }
+        if let Some(ep) = &self.entry_point {
+            if !self.nodes.contains_key(ep) {
+                return Err(CoreError::Invalid("missing entry point node".into()));
+            }
+        }
+        for (key, node) in &self.nodes {
+            validate_point_id(&node.id)?;
+            if key != &node.id {
+                return Err(CoreError::Invalid("mismatched node key".into()));
+            }
+            validate_vector(&node.vector, self.dim, "node vector")?;
+            if node.level > 32 || node.neighbors.len() != node.level + 1 {
+                return Err(CoreError::Invalid("invalid node layer structure".into()));
+            }
+        }
+        Ok(())
     }
 
     pub fn insert(&mut self, point: Point) -> Result<()> {
-        if point.vector.len() != self.dim {
+        validate_point_id(&point.id)?;
+        validate_vector(&point.vector, self.dim, "vector")?;
+        if !self.nodes.contains_key(&point.id) && self.nodes.len() >= MAX_POINTS {
             return Err(CoreError::Invalid(format!(
-                "vector dimension {} does not match collection dimension {}",
-                point.vector.len(),
-                self.dim
+                "collection exceeds maximum vector capacity ({MAX_POINTS})"
             )));
         }
         if self.nodes.contains_key(&point.id) {
@@ -116,14 +213,13 @@ impl HnswIndex {
             neighbors: vec![Vec::new(); level + 1],
         };
 
-        if self.entry_point.is_none() {
+        let Some(mut entry) = self.entry_point.clone() else {
             self.max_level = level;
             self.entry_point = Some(id.clone());
             self.nodes.insert(id, node);
             return Ok(());
-        }
+        };
 
-        let mut entry = self.entry_point.clone().unwrap();
         for layer in ((level + 1)..=self.max_level).rev() {
             entry = self.greedy_closest(&point.vector, &entry, layer);
         }
@@ -172,28 +268,43 @@ impl HnswIndex {
             }
         }
         if self.entry_point.as_deref() == Some(id) {
-            self.entry_point = self.nodes.keys().next().cloned();
-            self.max_level = self.nodes.values().map(|n| n.level).max().unwrap_or(0);
+            let next = self
+                .nodes
+                .values()
+                .max_by_key(|n| n.level)
+                .map(|n| (n.id.clone(), n.level));
+            match next {
+                Some((ep, lvl)) => {
+                    self.entry_point = Some(ep);
+                    self.max_level = lvl;
+                }
+                None => {
+                    self.entry_point = None;
+                    self.max_level = 0;
+                }
+            }
         }
         existed
     }
 
     pub fn search(&self, query: &[f32], k: usize, ef: usize) -> Result<Vec<SearchHit>> {
-        if query.len() != self.dim {
-            return Err(CoreError::Invalid(format!(
-                "query dimension {} does not match collection dimension {}",
-                query.len(),
-                self.dim
-            )));
+        validate_vector(query, self.dim, "query")?;
+        if k > MAX_TOP_K {
+            return Err(CoreError::Invalid(format!("k must be <= {MAX_TOP_K}")));
+        }
+        if ef > MAX_EF_SEARCH {
+            return Err(CoreError::Invalid(format!("ef must be <= {MAX_EF_SEARCH}")));
         }
         if k == 0 || self.nodes.is_empty() {
             return Ok(Vec::new());
         }
-        let mut entry = self.entry_point.clone().unwrap();
+        let Some(mut entry) = self.entry_point.clone() else {
+            return Ok(Vec::new());
+        };
         for layer in (1..=self.max_level).rev() {
             entry = self.greedy_closest(query, &entry, layer);
         }
-        let ef = ef.max(k).min(self.nodes.len().max(k));
+        let ef = ef.max(k).min(self.nodes.len().max(k)).min(MAX_EF_SEARCH);
         let candidates = self.search_layer(query, &entry, ef, 0);
         let mut hits: Vec<_> = candidates
             .into_iter()
@@ -207,21 +318,17 @@ impl HnswIndex {
                 })
             })
             .collect();
-        hits.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(Ordering::Equal)
-        });
+        hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         Ok(hits)
     }
 
     pub fn brute_force_search(&self, query: &[f32], k: usize) -> Result<Vec<SearchHit>> {
-        if query.len() != self.dim {
-            return Err(CoreError::Invalid(format!(
-                "query dimension {} does not match collection dimension {}",
-                query.len(),
-                self.dim
-            )));
+        validate_vector(query, self.dim, "query")?;
+        if k > MAX_TOP_K {
+            return Err(CoreError::Invalid(format!("k must be <= {MAX_TOP_K}")));
+        }
+        if k == 0 || self.nodes.is_empty() {
+            return Ok(Vec::new());
         }
         let mut hits: Vec<_> = self
             .nodes
@@ -236,11 +343,7 @@ impl HnswIndex {
                 }
             })
             .collect();
-        hits.sort_by(|a, b| {
-            a.distance
-                .partial_cmp(&b.distance)
-                .unwrap_or(Ordering::Equal)
-        });
+        hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         hits.truncate(k);
         Ok(hits)
     }
@@ -259,7 +362,7 @@ impl HnswIndex {
         self.nodes
             .get(id)
             .map(|n| self.metric.distance(query, &n.vector))
-            .unwrap_or(f32::INFINITY)
+            .unwrap_or(f32::MAX)
     }
 
     fn greedy_closest(&self, query: &[f32], entry: &str, layer: usize) -> String {
@@ -294,15 +397,23 @@ impl HnswIndex {
         layer: usize,
     ) -> Vec<(f32, String)> {
         let mut visited = HashSet::new();
-        let mut candidates = vec![(self.dist(query, entry), entry.to_string())];
-        let mut results = candidates.clone();
+        let start_dist = self.dist(query, entry);
+        let mut candidates: BinaryHeap<Reverse<DistNode>> = BinaryHeap::new();
+        let mut results: BinaryHeap<DistNode> = BinaryHeap::new();
+        let start = DistNode {
+            dist: start_dist,
+            id: entry.to_string(),
+        };
+        candidates.push(Reverse(start.clone()));
+        results.push(start);
         visited.insert(entry.to_string());
 
-        while !candidates.is_empty() {
-            candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-            let (cand_dist, cand_id) = candidates.remove(0);
-            results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-            let worst = results.last().map(|x| x.0).unwrap_or(f32::INFINITY);
+        while let Some(Reverse(DistNode {
+            dist: cand_dist,
+            id: cand_id,
+        })) = candidates.pop()
+        {
+            let worst = results.peek().map(|x| x.dist).unwrap_or(f32::MAX);
             if results.len() >= ef && cand_dist > worst {
                 break;
             }
@@ -317,23 +428,24 @@ impl HnswIndex {
                     continue;
                 }
                 let d = self.dist(query, &nb);
-                let worst = results.last().map(|x| x.0).unwrap_or(f32::INFINITY);
+                let worst = results.peek().map(|x| x.dist).unwrap_or(f32::MAX);
                 if results.len() < ef || d < worst {
-                    candidates.push((d, nb.clone()));
-                    results.push((d, nb));
-                    results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+                    let item = DistNode { dist: d, id: nb };
+                    candidates.push(Reverse(item.clone()));
+                    results.push(item);
                     if results.len() > ef {
                         results.pop();
                     }
                 }
             }
         }
-        results.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-        results
+        let mut out: Vec<(f32, String)> = results.into_iter().map(|x| (x.dist, x.id)).collect();
+        out.sort_by(|a, b| a.0.total_cmp(&b.0));
+        out
     }
 
     fn select_neighbors(&self, mut candidates: Vec<(f32, String)>, m: usize) -> Vec<String> {
-        candidates.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
         candidates.into_iter().take(m).map(|(_, id)| id).collect()
     }
 
@@ -373,13 +485,13 @@ impl HnswIndex {
                 .nodes
                 .get(x)
                 .map(|n| metric.distance(&center, &n.vector))
-                .unwrap_or(f32::INFINITY);
+                .unwrap_or(f32::MAX);
             let dy = self
                 .nodes
                 .get(y)
                 .map(|n| metric.distance(&center, &n.vector))
-                .unwrap_or(f32::INFINITY);
-            dx.partial_cmp(&dy).unwrap_or(Ordering::Equal)
+                .unwrap_or(f32::MAX);
+            dx.total_cmp(&dy)
         });
         if neighbors.len() > self.m {
             neighbors.truncate(self.m);
@@ -459,5 +571,60 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded.search(&[0.0, 1.0, 2.0], 1, 10).unwrap()[0].id, "a");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_non_finite_and_out_of_bounds_vectors_and_limits() {
+        assert!(HnswIndex::new(0, Metric::Cosine, 8, 32).is_err());
+        assert!(HnswIndex::new(MAX_DIM + 1, Metric::Cosine, 8, 32).is_err());
+
+        let mut index = HnswIndex::new(3, Metric::Cosine, 8, 32).unwrap();
+        assert!(index
+            .insert(Point {
+                id: "bad-nan".into(),
+                vector: vec![1.0, f32::NAN, 0.0],
+                metadata: None,
+            })
+            .is_err());
+        assert!(index
+            .insert(Point {
+                id: "bad-inf".into(),
+                vector: vec![1.0, f32::INFINITY, 0.0],
+                metadata: None,
+            })
+            .is_err());
+        assert!(index
+            .insert(Point {
+                id: "bad-neginf".into(),
+                vector: vec![1.0, f32::NEG_INFINITY, 0.0],
+                metadata: None,
+            })
+            .is_err());
+        assert!(index
+            .insert(Point {
+                id: "".into(),
+                vector: vec![1.0, 0.0, 0.0],
+                metadata: None,
+            })
+            .is_err());
+        assert!(index
+            .insert(Point {
+                id: "ok".into(),
+                vector: vec![1.0, 0.0, 0.0],
+                metadata: None,
+            })
+            .is_ok());
+
+        // Query validation still runs even on non-empty or k=0 queries.
+        assert!(index.search(&[f32::NAN, 0.0, 0.0], 1, 10).is_err());
+        assert!(index.search(&[f32::INFINITY, 0.0, 0.0], 0, 10).is_err());
+        assert!(index.brute_force_search(&[f32::NAN, 0.0, 0.0], 1).is_err());
+        assert!(index.search(&[1.0, 0.0, 0.0], MAX_TOP_K + 1, 10).is_err());
+        assert!(index
+            .search(&[1.0, 0.0, 0.0], 1, MAX_EF_SEARCH + 1)
+            .is_err());
+        assert!(index
+            .brute_force_search(&[1.0, 0.0, 0.0], MAX_TOP_K + 1)
+            .is_err());
     }
 }

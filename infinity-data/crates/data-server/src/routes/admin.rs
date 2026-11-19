@@ -61,6 +61,50 @@ fn permission_grant_allowed(p: &Principal, permissions: &[String]) -> bool {
             .all(|permission| rbac::any_permission(&p.permissions, permission))
 }
 
+fn valid_permission(p: &str) -> bool {
+    (1..=64).contains(&p.len())
+        && p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b':' | b'*' | b'.'))
+}
+
+async fn validate_roles_exist(st: &SharedState, roles: &[String]) -> Result<(), ApiError> {
+    if roles.len() > 64 {
+        return Err(ApiError::BadRequest("too many roles".into()));
+    }
+    for r in roles {
+        if !valid_name(r) {
+            return Err(ApiError::BadRequest(format!("invalid role name: {r}")));
+        }
+        if !store::role_exists(&st.db, r).await? {
+            return Err(ApiError::BadRequest(format!("unknown role: {r}")));
+        }
+    }
+    Ok(())
+}
+
+async fn can_modify_target_user(
+    st: &SharedState,
+    principal: &Principal,
+    target_id: &str,
+) -> Result<(), ApiError> {
+    if caller_is_superadmin(principal) {
+        return Ok(());
+    }
+    let current_roles = store::user_roles(&st.db, target_id).await?;
+    if current_roles.iter().any(|r| r == ROLE_SUPERADMIN) {
+        return Err(ApiError::Forbidden(
+            "only superadmin may modify superadmin accounts".into(),
+        ));
+    }
+    let target_perms = store::user_permissions(&st.db, target_id).await?;
+    if !permission_grant_allowed(principal, &target_perms) {
+        return Err(ApiError::Forbidden(
+            "cannot modify a user holding permissions you do not hold".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// A caller may only assign roles whose full permission set they already hold.
 /// This mirrors `permission_grant_allowed` for the role-*assignment* paths so a
 /// `users:write` holder cannot escalate by attaching a more privileged role
@@ -152,6 +196,15 @@ pub async fn create_user(
             "username must be 1-64 characters: letters, numbers, '_' or '-'".into(),
         ));
     }
+    if let Some(dn) = &req.display_name {
+        if dn.len() > 128 || dn.chars().any(char::is_control) {
+            return Err(ApiError::BadRequest(
+                "display_name must be <= 128 non-control characters".into(),
+            ));
+        }
+    }
+    data_core::password::validate_user_password(&req.password)
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
     if !role_change_allowed(&principal, &req.roles) {
         return Err(ApiError::Forbidden(
             "only superadmin may grant superadmin".into(),
@@ -162,7 +215,13 @@ pub async fn create_user(
     } else {
         req.roles.clone()
     };
+    validate_roles_exist(&st, &roles).await?;
     assigned_roles_allowed(&st, &principal, &roles).await?;
+    if store::user_exists(&st.db, &email, username).await? {
+        return Err(ApiError::Conflict(
+            "user with that email or username already exists".into(),
+        ));
+    }
     let user = store::create_user(
         &st.db,
         &email,
@@ -192,6 +251,9 @@ pub async fn update_user(
     Json(req): Json<UpdateUser>,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("users:write")?;
+    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest("invalid user id".into()));
+    }
     if id == principal.user_id && req.disabled == Some(true) {
         return Err(ApiError::BadRequest(
             "cannot disable your own account".into(),
@@ -200,22 +262,20 @@ pub async fn update_user(
     let user = store::get_user(&st.db, &id)
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".into()))?;
-    if let Some(disabled) = req.disabled {
-        store::set_user_disabled(&st.db, &id, disabled).await?;
-    }
-    if let Some(roles) = req.roles {
-        let current_roles = store::user_roles(&st.db, &id).await?;
-        if current_roles.iter().any(|r| r == ROLE_SUPERADMIN) && !caller_is_superadmin(&principal) {
-            return Err(ApiError::Forbidden(
-                "only superadmin may modify superadmin roles".into(),
-            ));
-        }
-        if !role_change_allowed(&principal, &roles) {
+    can_modify_target_user(&st, &principal, &id).await?;
+    if let Some(roles) = &req.roles {
+        if !role_change_allowed(&principal, roles) {
             return Err(ApiError::Forbidden(
                 "only superadmin may grant superadmin".into(),
             ));
         }
-        assigned_roles_allowed(&st, &principal, &roles).await?;
+        validate_roles_exist(&st, roles).await?;
+        assigned_roles_allowed(&st, &principal, roles).await?;
+    }
+    if let Some(disabled) = req.disabled {
+        store::set_user_disabled(&st.db, &id, disabled).await?;
+    }
+    if let Some(roles) = req.roles {
         store::set_user_roles(&st.db, &id, &roles).await?;
     }
     store::audit(
@@ -228,8 +288,9 @@ pub async fn update_user(
         None,
     )
     .await;
+    let updated = store::get_user(&st.db, &id).await?.unwrap_or(user);
     let roles = store::user_roles(&st.db, &id).await?;
-    Ok(Json(json!({"user": user_json(&user, roles)})))
+    Ok(Json(json!({"user": user_json(&updated, roles)})))
 }
 
 pub async fn delete_user(
@@ -238,6 +299,9 @@ pub async fn delete_user(
     principal: Principal,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("users:write")?;
+    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest("invalid user id".into()));
+    }
     if id == principal.user_id {
         return Err(ApiError::BadRequest(
             "cannot delete your own account".into(),
@@ -246,6 +310,7 @@ pub async fn delete_user(
     if store::get_user(&st.db, &id).await?.is_none() {
         return Err(ApiError::NotFound("user not found".into()));
     }
+    can_modify_target_user(&st, &principal, &id).await?;
     store::delete_user(&st.db, &id).await?;
     store::audit(
         &st.db,
@@ -283,13 +348,36 @@ pub async fn upsert_role(
             "role name must be 1-64 characters: letters, numbers, '_' or '-'".into(),
         ));
     }
-    if !permission_grant_allowed(&principal, &req.permissions) {
+    if req.description.len() > 512 || req.description.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "role description must be <= 512 non-control characters".into(),
+        ));
+    }
+    if req.name == ROLE_SUPERADMIN && !caller_is_superadmin(&principal) {
         return Err(ApiError::Forbidden(
-            "cannot grant permissions caller does not hold".into(),
+            "only superadmin may modify superadmin role".into(),
         ));
     }
     if req.permissions.len() > 256 {
         return Err(ApiError::BadRequest("too many permissions".into()));
+    }
+    for p in &req.permissions {
+        if !valid_permission(p) {
+            return Err(ApiError::BadRequest(format!("invalid permission: {p}")));
+        }
+    }
+    if store::role_exists(&st.db, &req.name).await? {
+        let existing_perms = store::role_permissions(&st.db, &req.name).await?;
+        if !permission_grant_allowed(&principal, &existing_perms) {
+            return Err(ApiError::Forbidden(
+                "cannot modify a role holding permissions you do not hold".into(),
+            ));
+        }
+    }
+    if !permission_grant_allowed(&principal, &req.permissions) {
+        return Err(ApiError::Forbidden(
+            "cannot grant permissions caller does not hold".into(),
+        ));
     }
     store::upsert_role(&st.db, &req.name, &req.description, &req.permissions).await?;
     store::audit(
@@ -321,12 +409,13 @@ pub async fn create_api_key(
     Json(req): Json<CreateApiKey>,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("api_keys:write")?;
-    if req.name.trim().is_empty() || req.name.len() > 64 {
+    let trimmed = req.name.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 || trimmed.chars().any(char::is_control) {
         return Err(ApiError::BadRequest(
-            "API key name must be 1-64 characters".into(),
+            "API key name must be 1-64 non-control characters".into(),
         ));
     }
-    let (raw, info) = store::create_api_key(&st.db, req.name.trim()).await?;
+    let (raw, info) = store::create_api_key(&st.db, trimmed).await?;
     store::audit(
         &st.db,
         Some(&principal.user_id),
@@ -346,7 +435,12 @@ pub async fn delete_api_key(
     principal: Principal,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("api_keys:write")?;
-    store::delete_api_key(&st.db, &id).await?;
+    if id.is_empty() || id.len() > 128 || id.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest("invalid API key id".into()));
+    }
+    if !store::delete_api_key(&st.db, &id).await? {
+        return Err(ApiError::NotFound("API key not found".into()));
+    }
     store::audit(
         &st.db,
         Some(&principal.user_id),

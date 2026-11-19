@@ -7,6 +7,7 @@ use chrono::{Duration, Utc};
 use infinity_core::model::{AuditEvent, OAuthClient, Role, User};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
+use zeroize::Zeroize;
 
 use crate::config::Config;
 
@@ -43,6 +44,15 @@ pub struct UserRow {
     pub created_at: String,
     #[sqlx(default)]
     pub mfa_last_step: Option<i64>,
+}
+
+impl Drop for UserRow {
+    fn drop(&mut self) {
+        self.password_hash.zeroize();
+        if let Some(secret) = &mut self.mfa_secret {
+            secret.zeroize();
+        }
+    }
 }
 
 #[derive(FromRow)]
@@ -86,6 +96,8 @@ pub struct RefreshRow {
     pub scope: String,
     pub expires_at: String,
     pub revoked: i64,
+    #[sqlx(default)]
+    pub family_id: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -104,11 +116,10 @@ struct AuditRow {
 // ---------------------------------------------------------------------------
 
 pub async fn user_roles(db: &SqlitePool, user_id: &str) -> sqlx::Result<Vec<String>> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT role FROM user_roles WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_all(db)
-            .await?;
+    let rows: Vec<(String,)> = sqlx::query_as("SELECT role FROM user_roles WHERE user_id = ?")
+        .bind(user_id)
+        .fetch_all(db)
+        .await?;
     Ok(rows.into_iter().map(|r| r.0).collect())
 }
 
@@ -163,6 +174,7 @@ pub struct NewUser<'a> {
 
 pub async fn create_user(db: &SqlitePool, u: NewUser<'_>) -> sqlx::Result<String> {
     let id = Uuid::new_v4().to_string();
+    let mut tx = db.begin().await?;
     sqlx::query(
         "INSERT INTO users (id, email, username, display_name, password_hash, created_at)
          VALUES (?, ?, ?, ?, ?, ?)",
@@ -173,15 +185,16 @@ pub async fn create_user(db: &SqlitePool, u: NewUser<'_>) -> sqlx::Result<String
     .bind(u.display_name)
     .bind(u.password_hash)
     .bind(now())
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
     for role in u.roles {
         sqlx::query("INSERT OR IGNORE INTO user_roles (user_id, role) VALUES (?, ?)")
             .bind(&id)
             .bind(role)
-            .execute(db)
+            .execute(&mut *tx)
             .await?;
     }
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -222,7 +235,10 @@ pub async fn set_user_roles(db: &SqlitePool, id: &str, roles: &[String]) -> sqlx
 }
 
 pub async fn delete_user(db: &SqlitePool, id: &str) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(db).await?;
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(id)
+        .execute(db)
+        .await?;
     Ok(())
 }
 
@@ -231,11 +247,13 @@ pub async fn delete_user(db: &SqlitePool, id: &str) -> sqlx::Result<()> {
 // ---------------------------------------------------------------------------
 
 pub async fn set_mfa_secret(db: &SqlitePool, id: &str, secret: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE users SET mfa_secret = ?, mfa_enabled = 0 WHERE id = ?")
-        .bind(secret)
-        .bind(id)
-        .execute(db)
-        .await?;
+    sqlx::query(
+        "UPDATE users SET mfa_secret = ?, mfa_enabled = 0, mfa_last_step = NULL WHERE id = ?",
+    )
+    .bind(secret)
+    .bind(id)
+    .execute(db)
+    .await?;
     Ok(())
 }
 
@@ -248,18 +266,38 @@ pub async fn enable_mfa(db: &SqlitePool, id: &str) -> sqlx::Result<()> {
 }
 
 pub async fn disable_mfa(db: &SqlitePool, id: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE users SET mfa_enabled = 0, mfa_secret = NULL, mfa_last_step = NULL WHERE id = ?")
-        .bind(id)
-        .execute(db)
-        .await?;
+    let mut tx = db.begin().await?;
+    sqlx::query(
+        "UPDATE users SET mfa_enabled = 0, mfa_secret = NULL, mfa_last_step = NULL WHERE id = ?",
+    )
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
     sqlx::query("DELETE FROM recovery_codes WHERE user_id = ?")
         .bind(id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
+/// Atomically advance the highest TOTP time-step accepted for a user.
+/// Returns `false` if another concurrent request already consumed `step` or higher.
+pub async fn set_mfa_last_step_atomic(db: &SqlitePool, id: &str, step: i64) -> sqlx::Result<bool> {
+    let res = sqlx::query(
+        "UPDATE users SET mfa_last_step = ?
+         WHERE id = ? AND (mfa_last_step IS NULL OR mfa_last_step < ?)",
+    )
+    .bind(step)
+    .bind(id)
+    .bind(step)
+    .execute(db)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Record the highest TOTP time-step accepted for a user (one-time-use guard).
+#[allow(dead_code)]
 pub async fn set_mfa_last_step(db: &SqlitePool, id: &str, step: i64) -> sqlx::Result<()> {
     sqlx::query("UPDATE users SET mfa_last_step = ? WHERE id = ?")
         .bind(step)
@@ -269,19 +307,27 @@ pub async fn set_mfa_last_step(db: &SqlitePool, id: &str, step: i64) -> sqlx::Re
     Ok(())
 }
 
-pub async fn store_recovery_codes(db: &SqlitePool, id: &str, hashes: &[String]) -> sqlx::Result<()> {
+pub async fn store_recovery_codes(
+    db: &SqlitePool,
+    id: &str,
+    hashes: &[String],
+) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
     sqlx::query("DELETE FROM recovery_codes WHERE user_id = ?")
         .bind(id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
     for h in hashes {
-        sqlx::query("INSERT INTO recovery_codes (id, user_id, code_hash, used) VALUES (?, ?, ?, 0)")
-            .bind(Uuid::new_v4().to_string())
-            .bind(id)
-            .bind(h)
-            .execute(db)
-            .await?;
+        sqlx::query(
+            "INSERT INTO recovery_codes (id, user_id, code_hash, used) VALUES (?, ?, ?, 0)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(id)
+        .bind(h)
+        .execute(&mut *tx)
+        .await?;
     }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -386,7 +432,10 @@ pub async fn create_client(db: &SqlitePool, c: NewClient<'_>) -> sqlx::Result<St
     Ok(client_id)
 }
 
-pub async fn get_client_raw(db: &SqlitePool, client_id: &str) -> sqlx::Result<Option<(OAuthClient, Option<String>)>> {
+pub async fn get_client_raw(
+    db: &SqlitePool,
+    client_id: &str,
+) -> sqlx::Result<Option<(OAuthClient, Option<String>)>> {
     let row = sqlx::query_as::<_, ClientRow>("SELECT * FROM oauth_clients WHERE client_id = ?")
         .bind(client_id)
         .fetch_optional(db)
@@ -398,17 +447,28 @@ pub async fn get_client_raw(db: &SqlitePool, client_id: &str) -> sqlx::Result<Op
 }
 
 pub async fn list_clients(db: &SqlitePool) -> sqlx::Result<Vec<OAuthClient>> {
-    let rows = sqlx::query_as::<_, ClientRow>("SELECT * FROM oauth_clients ORDER BY created_at DESC")
-        .fetch_all(db)
-        .await?;
+    let rows =
+        sqlx::query_as::<_, ClientRow>("SELECT * FROM oauth_clients ORDER BY created_at DESC")
+            .fetch_all(db)
+            .await?;
     Ok(rows.into_iter().map(row_to_client).collect())
 }
 
 pub async fn delete_client(db: &SqlitePool, client_id: &str) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    sqlx::query("DELETE FROM auth_codes WHERE client_id = ?")
+        .bind(client_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE client_id = ?")
+        .bind(client_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM oauth_clients WHERE client_id = ?")
         .bind(client_id)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -468,16 +528,18 @@ pub async fn insert_refresh(
     user_id: &str,
     client_id: &str,
     scope: &str,
+    family_id: &str,
     ttl_secs: i64,
 ) -> sqlx::Result<()> {
     sqlx::query(
-        "INSERT INTO refresh_tokens (token_hash, user_id, client_id, scope, expires_at, revoked, created_at)
-         VALUES (?, ?, ?, ?, ?, 0, ?)",
+        "INSERT INTO refresh_tokens (token_hash, user_id, client_id, scope, family_id, expires_at, revoked, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 0, ?)",
     )
     .bind(token_hash)
     .bind(user_id)
     .bind(client_id)
     .bind(scope)
+    .bind(family_id)
     .bind(future(ttl_secs))
     .bind(now())
     .execute(db)
@@ -492,6 +554,23 @@ pub async fn get_refresh(db: &SqlitePool, token_hash: &str) -> sqlx::Result<Opti
         .await
 }
 
+/// Atomically consume a non-revoked refresh token for rotation (prevents concurrent
+/// double-redemption TOCTOU race). Returns `None` if already revoked or absent.
+pub async fn take_refresh_for_rotation(
+    db: &SqlitePool,
+    token_hash: &str,
+) -> sqlx::Result<Option<RefreshRow>> {
+    sqlx::query_as::<_, RefreshRow>(
+        "UPDATE refresh_tokens SET revoked = 1
+         WHERE token_hash = ? AND revoked = 0
+         RETURNING *",
+    )
+    .bind(token_hash)
+    .fetch_optional(db)
+    .await
+}
+
+#[allow(dead_code)]
 pub async fn revoke_refresh(db: &SqlitePool, token_hash: &str) -> sqlx::Result<()> {
     sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?")
         .bind(token_hash)
@@ -500,11 +579,32 @@ pub async fn revoke_refresh(db: &SqlitePool, token_hash: &str) -> sqlx::Result<(
     Ok(())
 }
 
-/// Revoke every refresh token for a user+client (used on reuse detection).
-pub async fn revoke_refresh_family(db: &SqlitePool, user_id: &str, client_id: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ? AND client_id = ?")
+/// Revoke every refresh token in the same rotation family (or fallback to
+/// user+client for rows created prior to family tracking) on reuse detection.
+pub async fn revoke_refresh_family(
+    db: &SqlitePool,
+    family_id: Option<&str>,
+    user_id: &str,
+    client_id: &str,
+) -> sqlx::Result<()> {
+    if let Some(fid) = family_id {
+        sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE family_id = ?")
+            .bind(fid)
+            .execute(db)
+            .await?;
+    } else {
+        sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ? AND client_id = ?")
+            .bind(user_id)
+            .bind(client_id)
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
+
+pub async fn revoke_user_refresh_tokens(db: &SqlitePool, user_id: &str) -> sqlx::Result<()> {
+    sqlx::query("UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?")
         .bind(user_id)
-        .bind(client_id)
         .execute(db)
         .await?;
     Ok(())
@@ -514,7 +614,12 @@ pub async fn revoke_refresh_family(db: &SqlitePool, user_id: &str, client_id: &s
 // Sessions (dashboard cookie auth)
 // ---------------------------------------------------------------------------
 
-pub async fn create_session(db: &SqlitePool, id_hash: &str, user_id: &str, ttl: i64) -> sqlx::Result<()> {
+pub async fn create_session(
+    db: &SqlitePool,
+    id_hash: &str,
+    user_id: &str,
+    ttl: i64,
+) -> sqlx::Result<()> {
     sqlx::query("INSERT INTO sessions (id, user_id, expires_at, created_at) VALUES (?, ?, ?, ?)")
         .bind(id_hash)
         .bind(user_id)
@@ -536,16 +641,44 @@ pub async fn get_session_user(db: &SqlitePool, id_hash: &str) -> sqlx::Result<Op
             let valid = chrono::DateTime::parse_from_rfc3339(&exp)
                 .map(|t| t > Utc::now())
                 .unwrap_or(false);
-            Ok(if valid { Some(uid) } else { None })
+            if !valid {
+                let _ = sqlx::query("DELETE FROM sessions WHERE id = ?")
+                    .bind(id_hash)
+                    .execute(db)
+                    .await;
+                Ok(None)
+            } else {
+                Ok(Some(uid))
+            }
         }
         None => Ok(None),
     }
 }
 
-#[allow(dead_code)]
 pub async fn delete_session(db: &SqlitePool, id_hash: &str) -> sqlx::Result<()> {
     sqlx::query("DELETE FROM sessions WHERE id = ?")
         .bind(id_hash)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_user_sessions(db: &SqlitePool, user_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+        .bind(user_id)
+        .execute(db)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_other_user_sessions(
+    db: &SqlitePool,
+    user_id: &str,
+    keep_id_hash: &str,
+) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM sessions WHERE user_id = ? AND id != ?")
+        .bind(user_id)
+        .bind(keep_id_hash)
         .execute(db)
         .await?;
     Ok(())
@@ -579,12 +712,11 @@ pub async fn audit(
 }
 
 pub async fn list_audit(db: &SqlitePool, limit: i64) -> sqlx::Result<Vec<AuditEvent>> {
-    let rows = sqlx::query_as::<_, AuditRow>(
-        "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?",
-    )
-    .bind(limit)
-    .fetch_all(db)
-    .await?;
+    let rows =
+        sqlx::query_as::<_, AuditRow>("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?")
+            .bind(limit)
+            .fetch_all(db)
+            .await?;
     Ok(rows
         .into_iter()
         .map(|r| AuditEvent {
@@ -607,43 +739,60 @@ pub async fn list_audit(db: &SqlitePool, limit: i64) -> sqlx::Result<Vec<AuditEv
 pub async fn seed(db: &SqlitePool, config: &Config) -> anyhow::Result<()> {
     use infinity_core::rbac::{ROLE_ADMIN, ROLE_SUPERADMIN, ROLE_USER};
 
-    upsert_role(db, &Role {
-        name: ROLE_SUPERADMIN.into(),
-        description: "Full platform control".into(),
-        permissions: vec!["*:*".into()],
-    })
+    upsert_role(
+        db,
+        &Role {
+            name: ROLE_SUPERADMIN.into(),
+            description: "Full platform control".into(),
+            permissions: vec!["*:*".into()],
+        },
+    )
     .await?;
-    upsert_role(db, &Role {
-        name: ROLE_ADMIN.into(),
-        description: "Manage users, clients and roles".into(),
-        permissions: vec![
-            "users:*".into(),
-            "clients:*".into(),
-            "roles:read".into(),
-            "audit:read".into(),
-        ],
-    })
+    upsert_role(
+        db,
+        &Role {
+            name: ROLE_ADMIN.into(),
+            description: "Manage users, clients and roles".into(),
+            permissions: vec![
+                "users:*".into(),
+                "clients:*".into(),
+                "roles:read".into(),
+                "audit:read".into(),
+            ],
+        },
+    )
     .await?;
-    upsert_role(db, &Role {
-        name: ROLE_USER.into(),
-        description: "Standard end user".into(),
-        permissions: vec!["profile:read".into(), "profile:write".into()],
-    })
+    upsert_role(
+        db,
+        &Role {
+            name: ROLE_USER.into(),
+            description: "Standard end user".into(),
+            permissions: vec!["profile:read".into(), "profile:write".into()],
+        },
+    )
     .await?;
 
-    // Purge expired sessions so the table cannot grow without bound.
+    // Purge expired sessions and auth codes so tables cannot grow without bound.
+    let current = now();
     sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
-        .bind(now())
+        .bind(&current)
+        .execute(db)
+        .await?;
+    sqlx::query("DELETE FROM auth_codes WHERE expires_at <= ?")
+        .bind(&current)
         .execute(db)
         .await?;
 
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(db).await?;
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(db)
+        .await?;
     if count.0 == 0 {
-        // Never persist a shipped default credential. If the operator left the
-        // built-in placeholder in place, generate a strong random password and
-        // surface it once in the logs.
-        let default_placeholder = Config::default().admin_password;
-        let password = if config.admin_password == default_placeholder {
+        if crate::config::is_placeholder_admin_password(&config.admin_password) {
+            anyhow::bail!(
+                "refusing default or placeholder admin_password; set a strong >=12-character password or leave unset to auto-generate"
+            );
+        }
+        let password = if config.admin_password.trim().is_empty() {
             let generated = crate::util::random_token();
             tracing::warn!(
                 "no INFINITY_ADMIN_PASSWORD set — generated a random admin password (shown once): {}",
@@ -651,6 +800,9 @@ pub async fn seed(db: &SqlitePool, config: &Config) -> anyhow::Result<()> {
             );
             generated
         } else {
+            if config.admin_password.chars().count() < 12 {
+                anyhow::bail!("seed admin_password must be at least 12 characters");
+            }
             config.admin_password.clone()
         };
         let hash = infinity_core::password::hash_password(&password)?;

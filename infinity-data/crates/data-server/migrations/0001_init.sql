@@ -1,4 +1,4 @@
-﻿-- Infinity Data initial schema (SQLite). Runtime sqlx queries only.
+-- Infinity Data initial schema (SQLite). Runtime sqlx queries only.
 CREATE TABLE IF NOT EXISTS users (
     id            TEXT PRIMARY KEY,
     email         TEXT NOT NULL UNIQUE,

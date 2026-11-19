@@ -88,9 +88,13 @@ pub struct AuditRow {
 impl TryFrom<CollectionDbRow> for CollectionRow {
     type Error = anyhow::Error;
     fn try_from(r: CollectionDbRow) -> Result<Self, Self::Error> {
+        let dim = usize::try_from(r.dim).map_err(|_| anyhow::anyhow!("invalid collection dim"))?;
+        if dim == 0 || dim > data_core::hnsw::MAX_DIM {
+            anyhow::bail!("collection dim out of bounds: {dim}");
+        }
         Ok(Self {
             name: r.name,
-            dim: r.dim as usize,
+            dim,
             metric: Metric::from_str(&r.metric).map_err(anyhow::Error::msg)?,
             created_at: r.created_at,
         })
@@ -119,6 +123,7 @@ pub async fn seed(db: &SqlitePool, config: &Config) -> anyhow::Result<()> {
         .fetch_one(db)
         .await?;
     if count.0 == 0 {
+        data_core::password::validate_admin_password(&config.admin_password)?;
         let hash = data_core::password::hash_password(&config.admin_password)?;
         let id = Uuid::new_v4().to_string();
         sqlx::query("INSERT INTO users (id, email, username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)")
@@ -221,6 +226,15 @@ pub async fn list_users(db: &SqlitePool) -> sqlx::Result<Vec<UserRow>> {
         .await
 }
 
+pub async fn user_exists(db: &SqlitePool, email: &str, username: &str) -> sqlx::Result<bool> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users WHERE email = ? OR username = ?")
+        .bind(email)
+        .bind(username)
+        .fetch_one(db)
+        .await?;
+    Ok(row.0 > 0)
+}
+
 pub async fn create_user(
     db: &SqlitePool,
     email: &str,
@@ -232,13 +246,31 @@ pub async fn create_user(
     let hash = data_core::password::hash_password(password)?;
     sqlx::query("INSERT INTO users (id, email, username, display_name, password_hash, created_at) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(&id).bind(email).bind(username).bind(display_name).bind(hash).bind(now()).execute(db).await?;
-    Ok(get_user(db, &id).await?.expect("created user exists"))
+    get_user(db, &id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("created user missing"))
 }
 
 pub async fn set_user_disabled(db: &SqlitePool, id: &str, disabled: bool) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
     sqlx::query("UPDATE users SET disabled = ? WHERE id = ?")
         .bind(if disabled { 1 } else { 0 })
         .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    if disabled {
+        sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+pub async fn delete_user_sessions(db: &SqlitePool, user_id: &str) -> sqlx::Result<()> {
+    sqlx::query("DELETE FROM sessions WHERE user_id = ?")
+        .bind(user_id)
         .execute(db)
         .await?;
     Ok(())
@@ -308,6 +340,14 @@ pub async fn list_roles(db: &SqlitePool) -> sqlx::Result<Vec<RoleInfo>> {
         .await
 }
 
+pub async fn role_exists(db: &SqlitePool, role: &str) -> sqlx::Result<bool> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM roles WHERE name = ?")
+        .bind(role)
+        .fetch_one(db)
+        .await?;
+    Ok(row.0 > 0)
+}
+
 pub async fn role_permissions(db: &SqlitePool, role: &str) -> sqlx::Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT permission FROM role_permissions WHERE role_name = ? ORDER BY permission",
@@ -364,16 +404,20 @@ pub async fn get_session_user(db: &SqlitePool, id_hash: &str) -> sqlx::Result<Op
             .bind(id_hash)
             .fetch_optional(db)
             .await?;
-    Ok(match row {
+    match row {
         Some((uid, exp))
             if chrono::DateTime::parse_from_rfc3339(&exp)
                 .map(|t| t > Utc::now())
                 .unwrap_or(false) =>
         {
-            Some(uid)
+            Ok(Some(uid))
         }
-        _ => None,
-    })
+        Some(_) => {
+            let _ = delete_session(db, id_hash).await;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
 }
 
 pub async fn delete_session(db: &SqlitePool, id_hash: &str) -> sqlx::Result<()> {
@@ -425,30 +469,60 @@ pub async fn list_api_keys(db: &SqlitePool) -> sqlx::Result<Vec<ApiKeyInfo>> {
     .await
 }
 
-pub async fn delete_api_key(db: &SqlitePool, id: &str) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM api_keys WHERE id = ?")
+pub async fn delete_api_key(db: &SqlitePool, id: &str) -> sqlx::Result<bool> {
+    let res = sqlx::query("DELETE FROM api_keys WHERE id = ?")
         .bind(id)
         .execute(db)
         .await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
+}
+
+#[derive(Debug, FromRow)]
+struct ApiKeyAuthRow {
+    id: String,
+    name: String,
+    prefix: String,
+    key_hash: String,
+    created_at: String,
+    last_used_at: Option<String>,
 }
 
 pub async fn verify_api_key(db: &SqlitePool, raw: &str) -> sqlx::Result<Option<ApiKeyInfo>> {
-    let hash = sha256_hex(raw);
-    let row = sqlx::query_as::<_, ApiKeyInfo>(
-        "SELECT id, name, prefix, created_at, last_used_at FROM api_keys WHERE key_hash = ?",
+    if !raw.starts_with("idat_")
+        || !(16..=256).contains(&raw.len())
+        || raw.chars().any(char::is_control)
+    {
+        return Ok(None);
+    }
+    let prefix: String = raw.chars().take(12).collect();
+    let candidate_hash = sha256_hex(raw);
+    let rows = sqlx::query_as::<_, ApiKeyAuthRow>(
+        "SELECT id, name, prefix, key_hash, created_at, last_used_at FROM api_keys WHERE prefix = ?",
     )
-    .bind(hash)
-    .fetch_optional(db)
+    .bind(&prefix)
+    .fetch_all(db)
     .await?;
-    if let Some(info) = &row {
+    let mut matched: Option<ApiKeyInfo> = None;
+    for row in rows {
+        if data_core::password::constant_time_eq(candidate_hash.as_bytes(), row.key_hash.as_bytes())
+        {
+            matched = Some(ApiKeyInfo {
+                id: row.id,
+                name: row.name,
+                prefix: row.prefix,
+                created_at: row.created_at,
+                last_used_at: row.last_used_at,
+            });
+        }
+    }
+    if let Some(info) = &matched {
         sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE id = ?")
             .bind(now())
             .bind(&info.id)
             .execute(db)
             .await?;
     }
-    Ok(row)
+    Ok(matched)
 }
 
 pub async fn insert_collection(
@@ -504,11 +578,11 @@ pub async fn upsert_points(
     db: &SqlitePool,
     collection: &str,
     points: &[Point],
-) -> sqlx::Result<()> {
+) -> anyhow::Result<()> {
     let mut tx = db.begin().await?;
     let ts = now();
     for p in points {
-        let vector_json = serde_json::to_string(&p.vector).unwrap_or_else(|_| "[]".into());
+        let vector_json = serde_json::to_string(&p.vector)?;
         let metadata_json = p.metadata.as_ref().map(|m| m.to_string());
         sqlx::query(
             "INSERT INTO vector_points (collection_name, id, vector_json, metadata_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) \
@@ -547,15 +621,15 @@ pub async fn vector_count(db: &SqlitePool, collection: Option<&str>) -> sqlx::Re
             .fetch_one(db)
             .await?
     };
-    Ok(c.0 as usize)
+    Ok(usize::try_from(c.0).unwrap_or(0))
 }
 
 pub async fn insert_table(
     db: &SqlitePool,
     name: &str,
     columns: &[TableColumn],
-) -> sqlx::Result<()> {
-    let cols = serde_json::to_string(columns).unwrap_or_else(|_| "[]".into());
+) -> anyhow::Result<()> {
+    let cols = serde_json::to_string(columns)?;
     sqlx::query("INSERT INTO analytics_tables (name, columns, created_at) VALUES (?, ?, ?)")
         .bind(name)
         .bind(cols)
@@ -592,6 +666,19 @@ pub async fn delete_table(db: &SqlitePool, name: &str) -> sqlx::Result<()> {
     Ok(())
 }
 
+#[derive(Debug)]
+pub enum InsertRowsError {
+    TableNotFound,
+    LimitExceeded { max_rows: usize },
+    Db(sqlx::Error),
+}
+
+impl From<sqlx::Error> for InsertRowsError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Db(e)
+    }
+}
+
 pub async fn insert_rows(
     db: &SqlitePool,
     table: &str,
@@ -613,12 +700,64 @@ pub async fn insert_rows(
     Ok(())
 }
 
+/// Atomically verifies table existence, enforces `max_rows`, and inserts all rows
+/// inside a single `BEGIN IMMEDIATE` transaction so concurrent callers cannot race
+/// past `max_rows_per_table`.
+pub async fn insert_rows_bounded(
+    db: &SqlitePool,
+    table: &str,
+    rows: &[serde_json::Value],
+    max_rows: usize,
+) -> Result<(), InsertRowsError> {
+    let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;
+    let exists: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM analytics_tables WHERE name = ?")
+        .bind(table)
+        .fetch_one(&mut *tx)
+        .await?;
+    if exists.0 == 0 {
+        return Err(InsertRowsError::TableNotFound);
+    }
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM table_rows WHERE table_name = ?")
+        .bind(table)
+        .fetch_one(&mut *tx)
+        .await?;
+    let existing = usize::try_from(count.0).unwrap_or(0);
+    if existing.saturating_add(rows.len()) > max_rows {
+        return Err(InsertRowsError::LimitExceeded { max_rows });
+    }
+    for row in rows {
+        sqlx::query(
+            "INSERT INTO table_rows (id, table_name, row_json, created_at) VALUES (?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(table)
+        .bind(row.to_string())
+        .bind(now())
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn load_rows(db: &SqlitePool, table: &str) -> anyhow::Result<Vec<serde_json::Value>> {
-    let rows: Vec<(String,)> =
-        sqlx::query_as("SELECT row_json FROM table_rows WHERE table_name = ? ORDER BY created_at")
-            .bind(table)
-            .fetch_all(db)
-            .await?;
+    load_rows_bounded(db, table, data_core::aggregation::MAX_INPUT_ROWS).await
+}
+
+pub async fn load_rows_bounded(
+    db: &SqlitePool,
+    table: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let cap = i64::try_from(limit.clamp(1, data_core::aggregation::MAX_INPUT_ROWS))
+        .unwrap_or(data_core::aggregation::MAX_INPUT_ROWS as i64);
+    let rows: Vec<(String,)> = sqlx::query_as(
+        "SELECT row_json FROM table_rows WHERE table_name = ? ORDER BY created_at LIMIT ?",
+    )
+    .bind(table)
+    .bind(cap)
+    .fetch_all(db)
+    .await?;
     Ok(rows
         .into_iter()
         .filter_map(|(s,)| serde_json::from_str(&s).ok())
@@ -630,7 +769,7 @@ pub async fn table_count(db: &SqlitePool, table: &str) -> sqlx::Result<usize> {
         .bind(table)
         .fetch_one(db)
         .await?;
-    Ok(c.0 as usize)
+    Ok(usize::try_from(c.0).unwrap_or(0))
 }
 
 pub async fn stats_counts(db: &SqlitePool) -> sqlx::Result<(usize, usize, usize, usize, usize)> {
@@ -650,11 +789,11 @@ pub async fn stats_counts(db: &SqlitePool) -> sqlx::Result<(usize, usize, usize,
         .fetch_one(db)
         .await?;
     Ok((
-        collections.0 as usize,
-        vectors.0 as usize,
-        tables.0 as usize,
-        rows.0 as usize,
-        users.0 as usize,
+        usize::try_from(collections.0).unwrap_or(0),
+        usize::try_from(vectors.0).unwrap_or(0),
+        usize::try_from(tables.0).unwrap_or(0),
+        usize::try_from(rows.0).unwrap_or(0),
+        usize::try_from(users.0).unwrap_or(0),
     ))
 }
 

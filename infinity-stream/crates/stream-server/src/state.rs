@@ -6,7 +6,7 @@ use sqlx::SqlitePool;
 use stream_core::bm25::Bm25Index;
 use stream_core::commit_log::CommitLog;
 use stream_core::model::LogRecord;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 use crate::config::Config;
 use crate::ratelimit::IpRateLimiter;
@@ -21,12 +21,16 @@ pub struct AppState {
     pub produced_times: Mutex<VecDeque<Instant>>,
     pub login_throttle: LoginThrottle,
     pub ip_limiter: IpRateLimiter,
+    pub ws_semaphore: Arc<Semaphore>,
 }
 
 pub type SharedState = Arc<AppState>;
 
 impl AppState {
     pub async fn topic_sender(&self, topic: &str) -> broadcast::Sender<LogRecord> {
+        if let Some(tx) = self.broadcasts.read().await.get(topic) {
+            return tx.clone();
+        }
         let mut map = self.broadcasts.write().await;
         map.entry(topic.to_string())
             .or_insert_with(|| {

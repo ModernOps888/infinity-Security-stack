@@ -1,4 +1,7 @@
 use axum::extract::{Path, State};
+use axum::http::header::{CACHE_CONTROL, PRAGMA};
+use axum::http::HeaderValue;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
@@ -24,28 +27,41 @@ fn deny_api_keys(p: &Principal) -> Result<(), ApiError> {
     Ok(())
 }
 
-pub async fn list(
-    State(st): State<SharedState>,
-    p: Principal,
-) -> ApiResult<Json<serde_json::Value>> {
+fn with_no_store(mut resp: Response) -> Response {
+    resp.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    resp.headers_mut()
+        .insert(PRAGMA, HeaderValue::from_static("no-cache"));
+    resp
+}
+
+pub async fn list(State(st): State<SharedState>, p: Principal) -> ApiResult<Response> {
     deny_api_keys(&p)?;
     p.require("keys:read")?;
-    Ok(Json(json!({"keys": store::list_api_keys(&st.db).await?})))
+    Ok(with_no_store(
+        Json(json!({"keys": store::list_api_keys(&st.db).await?})).into_response(),
+    ))
 }
 
 pub async fn create(
     State(st): State<SharedState>,
     p: Principal,
     Json(req): Json<CreateKey>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Response> {
     deny_api_keys(&p)?;
     p.require("keys:create")?;
-    if req.name.trim().is_empty() || req.name.len() > 128 {
+    let trimmed = req.name.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 || trimmed.chars().any(|c| c.is_control()) {
         return Err(ApiError::BadRequest("key name must be 1-128 chars".into()));
     }
-    let (id, token) = store::create_api_key(&st.db, &req.name).await?;
-    Ok(Json(
-        json!({"id": id, "key": token, "note": "store this key now; only its SHA-256 hash is persisted"}),
+    let (id, token) = store::create_api_key(&st.db, trimmed).await?;
+    Ok(with_no_store(
+        Json(json!({
+            "id": id,
+            "key": token,
+            "note": "store this key now; only its SHA-256 hash is persisted"
+        }))
+        .into_response(),
     ))
 }
 
@@ -56,6 +72,18 @@ pub async fn delete_key(
 ) -> ApiResult<Json<serde_json::Value>> {
     deny_api_keys(&p)?;
     p.require("keys:delete")?;
-    store::revoke_api_key(&st.db, &id).await?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(ApiError::BadRequest("invalid key id".into()));
+    }
+    if !store::revoke_api_key(&st.db, &id).await? {
+        return Err(ApiError::NotFound(
+            "api key not found or already revoked".into(),
+        ));
+    }
     Ok(Json(json!({"ok": true})))
 }

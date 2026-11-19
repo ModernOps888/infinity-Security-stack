@@ -4,11 +4,11 @@
 //! asymmetric JWT signing (RS256 + JWKS), TOTP MFA, and the RBAC model.
 
 pub mod error;
-pub mod password;
 pub mod keys;
-pub mod token;
 pub mod mfa;
-pub mod rbac;
 pub mod model;
+pub mod password;
+pub mod rbac;
+pub mod token;
 
 pub use error::CoreError;

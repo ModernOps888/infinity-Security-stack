@@ -19,16 +19,20 @@ data_dir = "data"
 access_token_ttl_secs = 3600          # 1 hour
 refresh_token_ttl_secs = 2592000      # 30 days
 code_ttl_secs = 300                   # 5 minutes
-session_ttl_secs = 28800              # 8 hours
+session_ttl_secs = 7200               # 2 hours
 
 # Seed admin account (created on first run only).
-# Leave admin_password unset / as the placeholder and Infinity ID will
-# generate a strong random password and print it once in the logs.
+# Leave admin_password unset (empty) and Infinity ID will generate a strong
+# random password and print it once in the logs. Placeholder values are rejected.
 admin_email = "admin@infinity.local"
-admin_password = "ChangeMe_Infinity#2025"
+# admin_password = ""
 
 # Global per-IP request cap per 60s window (0 disables).
 global_rate_limit_per_min = 600
+
+# Optional list of trusted reverse-proxy IPs/CIDRs allowed to supply
+# X-Forwarded-For / Forwarded client IPs. Empty = always use peer socket IP.
+trusted_proxies = []
 
 # Display name shown in authenticator apps (no colons allowed).
 mfa_issuer = "Infinity ID"

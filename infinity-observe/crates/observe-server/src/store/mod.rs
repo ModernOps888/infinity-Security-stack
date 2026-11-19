@@ -4,12 +4,14 @@ use chrono::{Duration, Utc};
 use observe_core::digest::TDigest;
 use observe_core::model::QuantileSummary;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::{FromRow, SqlitePool};
 use uuid::Uuid;
 
 use crate::config::Config;
-use crate::util::{random_token, sha256_hex};
+use crate::util::{escape_like, random_token, sanitize_log_text, sha256_hex};
+
+const MAX_LOG_SEARCH_TOKENS: usize = 16;
 
 pub fn now() -> String {
     Utc::now().to_rfc3339()
@@ -108,6 +110,7 @@ pub struct AlertRuleRow {
     pub threshold: f64,
     pub window_secs: i64,
     pub enabled: i64,
+    pub webhook_url: Option<String>,
     pub created_at: String,
 }
 
@@ -132,14 +135,17 @@ pub async fn seed(db: &SqlitePool, config: &Config) -> anyhow::Result<()> {
         .fetch_one(db)
         .await?;
     if count.0 == 0 {
-        let default_placeholder = Config::default().admin_password;
-        let password = if config.admin_password == default_placeholder {
+        let password = if config.admin_password.trim().is_empty() {
             let generated = random_token();
             tracing::warn!(
                 "no OBSERVE_ADMIN_PASSWORD set — generated a random admin password (shown once): {}",
                 generated
             );
             generated
+        } else if observe_core::password::is_weak_or_default_password(&config.admin_password) {
+            anyhow::bail!(
+                "refusing weak or placeholder OBSERVE_ADMIN_PASSWORD; set a strong >=12-char password or leave unset to auto-generate"
+            );
         } else {
             config.admin_password.clone()
         };
@@ -205,16 +211,20 @@ pub async fn get_session_user(db: &SqlitePool, id_hash: &str) -> sqlx::Result<Op
             .bind(id_hash)
             .fetch_optional(db)
             .await?;
-    Ok(match row {
+    match row {
         Some((uid, exp))
             if chrono::DateTime::parse_from_rfc3339(&exp)
                 .map(|t| t > Utc::now())
                 .unwrap_or(false) =>
         {
-            Some(uid)
+            Ok(Some(uid))
         }
-        _ => None,
-    })
+        Some(_) => {
+            let _ = delete_session(db, id_hash).await;
+            Ok(None)
+        }
+        None => Ok(None),
+    }
 }
 
 pub async fn delete_session(db: &SqlitePool, id_hash: &str) -> sqlx::Result<()> {
@@ -262,10 +272,17 @@ pub async fn create_ingest_key(
 
 pub async fn list_ingest_keys(db: &SqlitePool) -> sqlx::Result<Vec<IngestKeyRow>> {
     sqlx::query_as::<_, IngestKeyRow>(
-        "SELECT id, name, prefix, created_at, revoked_at, last_used_at FROM ingest_keys ORDER BY created_at DESC",
+        "SELECT id, name, prefix, created_at, revoked_at, last_used_at FROM ingest_keys ORDER BY created_at DESC LIMIT 500",
     )
     .fetch_all(db)
     .await
+}
+
+pub async fn count_ingest_keys(db: &SqlitePool) -> sqlx::Result<i64> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ingest_keys")
+        .fetch_one(db)
+        .await?;
+    Ok(row.0)
 }
 
 pub async fn revoke_ingest_key(db: &SqlitePool, id: &str) -> sqlx::Result<()> {
@@ -295,6 +312,8 @@ pub async fn validate_ingest_key(db: &SqlitePool, key_hash: &str) -> sqlx::Resul
                 .await?;
             return Ok(Some(id));
         }
+    } else {
+        let _ = observe_core::password::constant_time_eq(&[0u8; 64], key_hash.as_bytes());
     }
     Ok(None)
 }
@@ -304,6 +323,14 @@ pub struct NewLog<'a> {
     pub level: &'a str,
     pub service: &'a str,
     pub message: &'a str,
+    pub attributes: Option<Value>,
+}
+
+pub struct OwnedLog {
+    pub timestamp: String,
+    pub level: String,
+    pub service: String,
+    pub message: String,
     pub attributes: Option<Value>,
 }
 
@@ -320,6 +347,22 @@ pub async fn insert_log(db: &SqlitePool, l: NewLog<'_>) -> sqlx::Result<()> {
     Ok(())
 }
 
+pub async fn insert_logs_batch(db: &SqlitePool, logs: &[OwnedLog]) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    for l in logs {
+        sqlx::query("INSERT INTO logs (id, timestamp, level, service, message, attributes) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&l.timestamp)
+            .bind(l.level.to_uppercase())
+            .bind(&l.service)
+            .bind(&l.message)
+            .bind(json_value(&l.attributes))
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await
+}
+
 pub struct LogFilter<'a> {
     pub service: Option<&'a str>,
     pub level: Option<&'a str>,
@@ -329,44 +372,41 @@ pub struct LogFilter<'a> {
 }
 
 pub async fn list_logs(db: &SqlitePool, f: LogFilter<'_>) -> sqlx::Result<Vec<LogRow>> {
-    let mut sql = String::from("SELECT * FROM logs WHERE 1=1");
-    if f.service.is_some() {
-        sql.push_str(" AND service = ?");
-    }
-    if f.level.is_some() {
-        sql.push_str(" AND level = ?");
-    }
-    if f.since.is_some() {
-        sql.push_str(" AND timestamp >= ?");
-    }
-    let tokens: Vec<String> =
-        f.q.unwrap_or("")
-            .split_whitespace()
-            .map(|s| format!("%{}%", s))
-            .collect();
-    for _ in &tokens {
-        sql.push_str(" AND message LIKE ?");
-    }
-    sql.push_str(" ORDER BY timestamp DESC LIMIT ?");
-    let mut q = sqlx::query_as::<_, LogRow>(&sql);
+    let mut qb: sqlx::QueryBuilder<sqlx::Sqlite> =
+        sqlx::QueryBuilder::new("SELECT * FROM logs WHERE 1=1");
     if let Some(v) = f.service {
-        q = q.bind(v);
+        qb.push(" AND service = ").push_bind(v);
     }
     if let Some(v) = f.level {
-        q = q.bind(v.to_uppercase());
+        qb.push(" AND level = ").push_bind(v.to_uppercase());
     }
     if let Some(v) = f.since {
-        q = q.bind(v);
+        qb.push(" AND timestamp >= ").push_bind(v);
     }
-    for tok in tokens {
-        q = q.bind(tok);
+    for tok in
+        f.q.unwrap_or("")
+            .split_whitespace()
+            .take(MAX_LOG_SEARCH_TOKENS)
+    {
+        qb.push(" AND message LIKE ")
+            .push_bind(format!("%{}%", escape_like(tok)))
+            .push(" ESCAPE '\\'");
     }
-    q.bind(f.limit.clamp(1, 500)).fetch_all(db).await
+    qb.push(" ORDER BY timestamp DESC LIMIT ")
+        .push_bind(f.limit.clamp(1, 500));
+    qb.build_query_as::<LogRow>().fetch_all(db).await
 }
 
 pub struct NewMetric<'a> {
     pub timestamp: &'a str,
     pub name: &'a str,
+    pub value: f64,
+    pub tags: Option<Value>,
+}
+
+pub struct OwnedMetric {
+    pub timestamp: String,
+    pub name: String,
     pub value: f64,
     pub tags: Option<Value>,
 }
@@ -381,6 +421,23 @@ pub async fn insert_metric(db: &SqlitePool, m: NewMetric<'_>) -> sqlx::Result<()
         .execute(db)
         .await?;
     Ok(())
+}
+
+pub async fn insert_metrics_batch(db: &SqlitePool, metrics: &[OwnedMetric]) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    for m in metrics {
+        sqlx::query(
+            "INSERT INTO metrics (id, timestamp, name, value, tags) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&m.timestamp)
+        .bind(&m.name)
+        .bind(m.value)
+        .bind(json_map_string(&m.tags))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
 }
 
 pub async fn metric_series(
@@ -425,12 +482,20 @@ pub async fn metric_summary(db: &SqlitePool, name: &str) -> sqlx::Result<Option<
     let mut digest = TDigest::new(120.0);
     let mut min = f64::INFINITY;
     let mut max = f64::NEG_INFINITY;
-    let mut sum = 0.0;
+    let mut mean = 0.0f64;
+    let mut n = 0u64;
     for (v,) in rows {
+        if !v.is_finite() {
+            continue;
+        }
         digest.add(v);
         min = min.min(v);
         max = max.max(v);
-        sum += v;
+        n += 1;
+        mean += (v - mean) / (n as f64);
+    }
+    if n == 0 {
+        return Ok(None);
     }
     digest.compress();
     let count = digest.count();
@@ -438,7 +503,7 @@ pub async fn metric_summary(db: &SqlitePool, name: &str) -> sqlx::Result<Option<
         count,
         min,
         max,
-        avg: sum / count as f64,
+        avg: mean,
         p50: digest.quantile(0.50).unwrap_or(0.0),
         p90: digest.quantile(0.90).unwrap_or(0.0),
         p95: digest.quantile(0.95).unwrap_or(0.0),
@@ -456,6 +521,19 @@ pub struct NewSpan<'a> {
     pub end_time: &'a str,
     pub duration_ms: f64,
     pub status: Option<&'a str>,
+    pub attributes: Option<Value>,
+}
+
+pub struct OwnedSpan {
+    pub trace_id: String,
+    pub span_id: String,
+    pub parent_span_id: Option<String>,
+    pub name: String,
+    pub service: String,
+    pub start_time: String,
+    pub end_time: String,
+    pub duration_ms: f64,
+    pub status: Option<String>,
     pub attributes: Option<Value>,
 }
 
@@ -480,11 +558,37 @@ pub async fn insert_span(db: &SqlitePool, s: NewSpan<'_>) -> sqlx::Result<()> {
     Ok(())
 }
 
+pub async fn insert_spans_batch(db: &SqlitePool, spans: &[OwnedSpan]) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    for s in spans {
+        sqlx::query(
+            "INSERT INTO spans (id, trace_id, span_id, parent_span_id, name, service, start_time, end_time, duration_ms, status, attributes)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(Uuid::new_v4().to_string())
+        .bind(&s.trace_id)
+        .bind(&s.span_id)
+        .bind(s.parent_span_id.as_deref())
+        .bind(&s.name)
+        .bind(&s.service)
+        .bind(&s.start_time)
+        .bind(&s.end_time)
+        .bind(s.duration_ms)
+        .bind(s.status.as_deref())
+        .bind(json_value(&s.attributes))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await
+}
+
 pub async fn get_trace(db: &SqlitePool, trace_id: &str) -> sqlx::Result<Vec<SpanRow>> {
-    sqlx::query_as::<_, SpanRow>("SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time ASC")
-        .bind(trace_id)
-        .fetch_all(db)
-        .await
+    sqlx::query_as::<_, SpanRow>(
+        "SELECT * FROM spans WHERE trace_id = ? ORDER BY start_time ASC LIMIT 2000",
+    )
+    .bind(trace_id)
+    .fetch_all(db)
+    .await
 }
 
 pub async fn list_traces(
@@ -515,9 +619,18 @@ pub async fn list_traces(
 }
 
 pub async fn list_alert_rules(db: &SqlitePool) -> sqlx::Result<Vec<AlertRuleRow>> {
-    sqlx::query_as::<_, AlertRuleRow>("SELECT * FROM alert_rules ORDER BY created_at DESC")
-        .fetch_all(db)
-        .await
+    sqlx::query_as::<_, AlertRuleRow>(
+        "SELECT * FROM alert_rules ORDER BY created_at DESC LIMIT 500",
+    )
+    .fetch_all(db)
+    .await
+}
+
+pub async fn count_alert_rules(db: &SqlitePool) -> sqlx::Result<i64> {
+    let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM alert_rules")
+        .fetch_one(db)
+        .await?;
+    Ok(row.0)
 }
 
 pub async fn create_alert_rule(
@@ -527,18 +640,20 @@ pub async fn create_alert_rule(
     target: &str,
     threshold: f64,
     window_secs: i64,
+    webhook_url: Option<&str>,
 ) -> sqlx::Result<AlertRuleRow> {
     let id = Uuid::new_v4().to_string();
     sqlx::query(
-        "INSERT INTO alert_rules (id, name, kind, target, threshold, window_secs, enabled, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+        "INSERT INTO alert_rules (id, name, kind, target, threshold, window_secs, enabled, webhook_url, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
     )
     .bind(&id)
     .bind(name)
     .bind(kind)
     .bind(target)
     .bind(threshold)
-    .bind(window_secs.max(60))
+    .bind(window_secs.clamp(60, 86_400))
+    .bind(webhook_url)
     .bind(now())
     .execute(db)
     .await?;
@@ -563,10 +678,14 @@ pub async fn list_alerts(db: &SqlitePool, limit: i64) -> sqlx::Result<Vec<AlertR
         .await
 }
 
-pub async fn evaluate_alerts(db: &SqlitePool) -> sqlx::Result<()> {
+pub async fn evaluate_alerts(db: &SqlitePool, config: &Config) -> sqlx::Result<()> {
     let rules = list_alert_rules(db).await?;
     for r in rules.into_iter().filter(|r| r.enabled != 0) {
-        let since = (Utc::now() - Duration::seconds(r.window_secs)).to_rfc3339();
+        let win = r.window_secs.clamp(60, 86_400);
+        let since = Utc::now()
+            .checked_sub_signed(Duration::seconds(win))
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339();
         match r.kind.as_str() {
             "error_log_count" => {
                 let count: (i64,) = sqlx::query_as(
@@ -580,20 +699,22 @@ pub async fn evaluate_alerts(db: &SqlitePool) -> sqlx::Result<()> {
                 if (count.0 as f64) > r.threshold {
                     fire_alert(
                         db,
+                        config,
                         &r,
                         "critical",
-                        &format!("{} error logs in last {}s", count.0, r.window_secs),
+                        &format!("{} error logs in last {}s", count.0, win),
                     )
                     .await?;
                 }
             }
             "metric_p99" => {
-                let vals: Vec<(f64,)> =
-                    sqlx::query_as("SELECT value FROM metrics WHERE name = ? AND timestamp >= ?")
-                        .bind(&r.target)
-                        .bind(&since)
-                        .fetch_all(db)
-                        .await?;
+                let vals: Vec<(f64,)> = sqlx::query_as(
+                    "SELECT value FROM metrics WHERE name = ? AND timestamp >= ? ORDER BY timestamp DESC LIMIT 10000",
+                )
+                .bind(&r.target)
+                .bind(&since)
+                .fetch_all(db)
+                .await?;
                 let mut d = TDigest::new(120.0);
                 for (v,) in vals {
                     d.add(v);
@@ -603,9 +724,15 @@ pub async fn evaluate_alerts(db: &SqlitePool) -> sqlx::Result<()> {
                     if p99 > r.threshold {
                         fire_alert(
                             db,
+                            config,
                             &r,
                             "warning",
-                            &format!("metric {} p99 {:.2} > {:.2}", r.target, p99, r.threshold),
+                            &format!(
+                                "metric {} p99 {:.2} > {:.2}",
+                                sanitize_log_text(&r.target),
+                                p99,
+                                r.threshold
+                            ),
                         )
                         .await?;
                     }
@@ -619,6 +746,7 @@ pub async fn evaluate_alerts(db: &SqlitePool) -> sqlx::Result<()> {
 
 async fn fire_alert(
     db: &SqlitePool,
+    config: &Config,
     r: &AlertRuleRow,
     severity: &str,
     message: &str,
@@ -632,15 +760,39 @@ async fn fire_alert(
     if recent.0 > 0 {
         return Ok(());
     }
+    let clean_msg = sanitize_log_text(message);
+    let clean_name = sanitize_log_text(&r.name);
+    let fired_at = now();
     sqlx::query("INSERT INTO alerts (id, rule_id, rule_name, severity, message, fired_at) VALUES (?, ?, ?, ?, ?, ?)")
         .bind(Uuid::new_v4().to_string())
         .bind(&r.id)
-        .bind(&r.name)
+        .bind(&clean_name)
         .bind(severity)
-        .bind(message)
-        .bind(now())
+        .bind(&clean_msg)
+        .bind(&fired_at)
         .execute(db)
         .await?;
+
+    if let Some(ref webhook_url) = r.webhook_url {
+        let url = webhook_url.clone();
+        let allow_insecure = config.allow_insecure_webhooks;
+        let allow_private = config.allow_private_webhooks;
+        let rule_id = r.id.clone();
+        let payload = json!({
+            "rule_id": rule_id,
+            "rule_name": clean_name,
+            "severity": severity,
+            "message": clean_msg,
+            "fired_at": fired_at,
+        });
+        tokio::spawn(async move {
+            if let Err(err) =
+                crate::ssrf::dispatch_webhook(&url, payload, allow_insecure, allow_private).await
+            {
+                tracing::warn!(rule_id = %rule_id, error = %err, "alert webhook delivery skipped/failed");
+            }
+        });
+    }
     Ok(())
 }
 

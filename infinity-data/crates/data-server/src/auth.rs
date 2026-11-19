@@ -61,22 +61,21 @@ impl FromRequestParts<SharedState> for Principal {
         state: &SharedState,
     ) -> Result<Self, Self::Rejection> {
         if let Some(auth) = parts.headers.get(axum::http::header::AUTHORIZATION) {
-            if let Ok(value) = auth.to_str() {
-                if let Some(raw) = value.strip_prefix("Bearer ") {
-                    if let Some(key) = store::verify_api_key(&state.db, raw).await? {
-                        return Ok(Principal {
-                            user_id: format!("api_key:{}", key.id),
-                            roles: vec!["api_key".into()],
-                            permissions: vec![
-                                "data:*".into(),
-                                "collections:*".into(),
-                                "tables:*".into(),
-                            ],
-                            first_party: true,
-                        });
-                    }
-                }
-            }
+            let value = auth
+                .to_str()
+                .map_err(|_| ApiError::Unauthorized("invalid authorization header".into()))?;
+            let raw = value
+                .strip_prefix("Bearer ")
+                .ok_or_else(|| ApiError::Unauthorized("invalid authorization scheme".into()))?;
+            let key = store::verify_api_key(&state.db, raw)
+                .await?
+                .ok_or_else(|| ApiError::Unauthorized("invalid API key".into()))?;
+            return Ok(Principal {
+                user_id: format!("api_key:{}", key.id),
+                roles: vec!["api_key".into()],
+                permissions: vec!["data:*".into(), "collections:*".into(), "tables:*".into()],
+                first_party: true,
+            });
         }
 
         if let Some(raw) = cookie_value(parts, SESSION_COOKIE) {

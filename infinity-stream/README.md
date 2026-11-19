@@ -9,7 +9,7 @@
 A fast, self-hostable alternative to **Kafka/Confluent, Elasticsearch, Algolia and Pusher** — without the JVM overhead, the ops burden, or usage-spike billing.
 
 [![Rust](https://img.shields.io/badge/built%20with-Rust-000000?logo=rust)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](../infinity-id/LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](../LICENSE)
 [![Status](https://img.shields.io/badge/status-alpha-orange)]()
 
 </div>
@@ -55,16 +55,18 @@ A modern dark-theme console is embedded in the binary — no separate frontend t
 
 | Area | Hardening |
 |---|---|
-| Passwords | Argon2id (memory-hard) |
-| API keys | Stored hashed, **O(1) indexed lookup** with **constant-time** comparison; **least-privilege data-plane scope** (produce/consume/search/create) — a leaked key cannot delete topics/indexes, and key-management routes **explicitly reject API keys** even if scopes are ever widened |
-| Sessions | `HttpOnly` + `SameSite=Strict` cookies (+ `Secure` by default off loopback), server-side revocation; 2-hour default TTL, expired sessions purged at startup |
-| Access control | RBAC guard on admin + write paths; no unauthenticated produce |
-| Path safety | Topic / index / group names are validated at the API **and** re-checked at the commit-log filesystem sink — no path traversal |
-| Abuse | Per-account login lockout + global per-IP rate limiting; throttle state is memory-bounded |
-| Transport | CSP, HSTS, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy` |
+| Passwords | Argon2id (`19456 KiB, t=2, p=1`), 1024-byte length cap, dummy verification against user enumeration, weak/placeholder admin passwords rejected at startup |
+| API keys | Stored SHA-256 hashed, **O(1) indexed lookup** with **constant-time** comparison; **least-privilege data-plane scope** (produce/consume/search/create); key-management routes reject API keys; invalid `Bearer` headers never fall back to session cookies |
+| Sessions | `HttpOnly` + `SameSite=Strict` cookies (+ `Secure` off loopback via strict URL check), session token rotation on login (fixation prevention), `Cache-Control: no-store` on auth/key responses, expired sessions purged on startup and lookup |
+| Access control & CSRF | Strict `resource:action` RBAC guard (no implicit wildcards); `Origin` and `Sec-Fetch-Site` validation on state-changing requests |
+| WebSockets | CSWSH protection via strict `Origin` allowlist validation (required for session cookies), topic existence verification, 64 KiB message / 16 KiB frame limits, bounded subscriber semaphore, and lag-backpressure / write-timeout handling |
+| Path & commit log safety | Topic / index / group / doc-id validation rejecting traversal, slashes, null bytes, and Windows reserved device names; canonical path & symlink containment checks; CRC32-verified bounded frames and overflow-safe offsets |
+| BM25 search | Bounded query bytes (`512`), query tokens (`64`), `k` (`100`), `offset` (`1000`), document nesting depth (`32`), index document cap (`100000`), and finite-score safety |
+| Abuse & proxy boundary | Bounded per-account login lockout + bounded per-IP rate limiting that ignores `X-Forwarded-For` unless peer matches `trusted_proxies` |
+| Transport & UI | Hardened CSP (`style-src 'self'`, `object-src 'none'`), HSTS, `X-Frame-Options: DENY`, `nosniff`, `Referrer-Policy`, safe DOM `textContent` rendering in the console, and CLI TLS enforcement off loopback with redirects disabled |
 | Errors | Generic client responses; internal errors logged server-side only |
-| SQL | Parameterized queries throughout |
-| Dependencies | `sqlx` upgraded 0.7 → 0.8.6, resolving RUSTSEC-2026-0098/0099/0104, RUSTSEC-2024-0363 and RUSTSEC-2025-0134 (vulnerable `rustls-webpki`, unmaintained `rustls-pemfile`, yanked `spin`) with **zero feature-flag changes**; the orphaned `rsa` workspace dependency (dead code, pulled in by nothing) was **removed entirely**, closing our direct exposure to RUSTSEC-2023-0071 (Marvin Attack timing side-channel). `cargo audit` still lists RUSTSEC-2023-0071 in `Cargo.lock` purely because `sqlx`'s optional MySQL backend (unused — this service is SQLite-only) pins a transitive `rsa` version that's never compiled into or reachable from this binary (confirmed via `cargo tree -i rsa`); suppressed via `.cargo/audit.toml` with the reasoning documented there. `cargo audit` now passes clean |
+| SQL | Parameterized queries throughout (`sqlx` 0.9) |
+| Dependencies | Upgraded to `sqlx` 0.9.1 (`libsqlite3-sys` 0.40.0, resolving RUSTSEC-2026-0459 and removing `rsa` / RUSTSEC-2023-0071 from `Cargo.lock` entirely). `cargo audit` reports **0 active vulnerabilities** and **0 ignored CVEs** (`ignore = []` in `.cargo/audit.toml`, with 1 informational `unmaintained` warning on `chrono` 0.4 tracked for future migration) |
 
 ---
 
@@ -85,7 +87,7 @@ infinity-stream/
 
 ```bash
 cd infinity-stream
-STREAM_ADMIN_PASSWORD='ChooseAStrongOne#2026' cargo run --bin infinity-stream
+STREAM_ADMIN_PASSWORD="$(openssl rand -base64 24)" cargo run --bin infinity-stream
 # open http://localhost:8092  (login: admin@infinity.local)
 ```
 
@@ -139,6 +141,6 @@ curl "http://localhost:8092/v1/indexes/products/search?q=rust&k=5" \
 
 ## License
 
-[Apache-2.0](../infinity-id/LICENSE) © Infinity Stack.
+[Apache-2.0](../LICENSE) © Infinity Stack.
 
 > ⚠️ **Alpha software.** Change default credentials and serve over HTTPS before production use.

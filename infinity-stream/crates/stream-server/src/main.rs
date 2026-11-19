@@ -1,34 +1,24 @@
 //! Infinity Stream — streaming log + BM25 search + realtime fan-out in one Rust binary.
-
-mod assets;
-mod auth;
-mod config;
-mod error;
-mod ratelimit;
-mod routes;
-mod state;
-mod store;
-mod throttle;
-mod util;
+//!
+//! Thin binary entrypoint; all logic lives in the `stream_server` library
+//! crate (`src/lib.rs`) so it can also be exercised directly by integration tests.
 
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
-use axum::extract::DefaultBodyLimit;
-use axum::http::{header, HeaderName, HeaderValue, Method};
-use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
 use stream_core::bm25::Bm25Index;
 use stream_core::commit_log::CommitLog;
-use tower_http::cors::CorsLayer;
-use tower_http::set_header::SetResponseHeaderLayer;
-use tower_http::trace::TraceLayer;
+use tokio::sync::Semaphore;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::config::Config;
-use crate::state::AppState;
+use stream_server::config::Config;
+use stream_server::state::AppState;
+use stream_server::{ratelimit, store, throttle};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -37,12 +27,20 @@ async fn main() -> anyhow::Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Warm the constant-time dummy Argon2id hash before serving login requests.
+    stream_core::password::warm_dummy_hash();
+
     let config = Config::load().context("loading configuration")?;
-    std::fs::create_dir_all(&config.data_dir).ok();
+    config.validate().context("validating configuration")?;
+    std::fs::create_dir_all(&config.data_dir)
+        .with_context(|| format!("creating data directory {}", config.data_dir))?;
 
     let opts = SqliteConnectOptions::from_str(&config.database_url)
         .context("parsing database_url")?
-        .create_if_missing(true);
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_secs(5));
     let db = SqlitePoolOptions::new()
         .max_connections(10)
         .connect_with(opts)
@@ -68,15 +66,30 @@ async fn main() -> anyhow::Result<()> {
         for (id, fields_json) in store::docs_for_index(&db, &name).await? {
             let fields: HashMap<String, serde_json::Value> =
                 serde_json::from_str(&fields_json).unwrap_or_default();
-            idx.index(id, fields);
+            if let Err(err) = idx.try_index(id, fields) {
+                tracing::warn!(index = %name, error = %err, "skipped oversized or invalid indexed doc");
+            }
         }
         indexes.insert(name, idx);
     }
 
     let bind = config.bind.clone();
-    let cors = build_cors(&config);
-    let body_limit = config.max_json_body_bytes;
+    if !config.cookie_secure() && !bind.starts_with("127.0.0.1:") && !bind.starts_with("[::1]:") {
+        tracing::warn!(
+            %bind,
+            public_url = %config.public_url,
+            "serving without Secure cookie flag on non-loopback bind; set HTTPS public_url behind TLS proxy in production"
+        );
+    }
+    tracing::info!(
+        trusted_proxies = config.trusted_proxies.len(),
+        ws_max_connections = config.ws_max_connections,
+        global_rate_limit_per_min = config.global_rate_limit_per_min,
+        "security policy initialized"
+    );
+
     let ip_limiter = ratelimit::IpRateLimiter::new(config.global_rate_limit_per_min);
+    let ws_semaphore = Arc::new(Semaphore::new(config.ws_max_connections));
     let state = Arc::new(AppState {
         db,
         config,
@@ -86,21 +99,10 @@ async fn main() -> anyhow::Result<()> {
         produced_times: tokio::sync::Mutex::new(VecDeque::new()),
         login_throttle: throttle::LoginThrottle::default(),
         ip_limiter,
+        ws_semaphore,
     });
 
-    let app = routes::router(state)
-        .layer(DefaultBodyLimit::max(body_limit))
-        .layer(cors)
-        .layer(SetResponseHeaderLayer::overriding(
-            header::CONTENT_SECURITY_POLICY,
-            HeaderValue::from_static("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"),
-        ))
-        .layer(SetResponseHeaderLayer::overriding(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff")))
-        .layer(SetResponseHeaderLayer::overriding(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY")))
-        .layer(SetResponseHeaderLayer::overriding(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer")))
-        .layer(SetResponseHeaderLayer::overriding(HeaderName::from_static("permissions-policy"), HeaderValue::from_static("geolocation=(), microphone=(), camera=()")))
-        .layer(SetResponseHeaderLayer::overriding(header::STRICT_TRANSPORT_SECURITY, HeaderValue::from_static("max-age=63072000; includeSubDomains")))
-        .layer(TraceLayer::new_for_http());
+    let app = stream_server::app(state);
 
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
@@ -110,26 +112,31 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await
     .context("server error")?;
     Ok(())
 }
 
-fn build_cors(config: &Config) -> CorsLayer {
-    let origins: Vec<HeaderValue> = config
-        .cors_origins
-        .iter()
-        .filter_map(|o| HeaderValue::from_str(o).ok())
-        .collect();
-    CorsLayer::new()
-        .allow_origin(origins)
-        .allow_methods([
-            Method::GET,
-            Method::POST,
-            Method::PATCH,
-            Method::PUT,
-            Method::DELETE,
-        ])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
-        .allow_credentials(true)
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut sigterm = signal(SignalKind::terminate()).ok();
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = async {
+                if let Some(ref mut sig) = sigterm {
+                    sig.recv().await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {}
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+    tracing::info!("shutdown signal received; draining connections");
 }

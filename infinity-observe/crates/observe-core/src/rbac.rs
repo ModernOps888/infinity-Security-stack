@@ -6,19 +6,22 @@ pub const ROLE_VIEWER: &str = "viewer";
 pub fn permissions_for_role(role: &str) -> Vec<String> {
     match role {
         ROLE_ADMIN => vec!["*:*".into()],
-        _ => vec![
+        ROLE_VIEWER => vec![
             "logs:read".into(),
             "metrics:read".into(),
             "traces:read".into(),
             "alerts:read".into(),
             "stats:read".into(),
         ],
+        // Fail closed for any unknown/empty role.
+        _ => Vec::new(),
     }
 }
 
 pub fn permission_matches(granted: &str, required: &str) -> bool {
-    let (gr, ga) = split(granted);
-    let (rr, ra) = split(required);
+    let (Some((gr, ga)), Some((rr, ra))) = (split(granted), split(required)) else {
+        return false;
+    };
     seg_match(gr, rr) && seg_match(ga, ra)
 }
 
@@ -26,11 +29,16 @@ pub fn any_permission(granted: &[String], required: &str) -> bool {
     granted.iter().any(|g| permission_matches(g, required))
 }
 
-fn split(p: &str) -> (&str, &str) {
-    match p.split_once(':') {
-        Some((r, a)) => (r, a),
-        None => (p, "*"),
+fn split(p: &str) -> Option<(&str, &str)> {
+    let (r, a) = p.split_once(':')?;
+    if r.is_empty()
+        || a.is_empty()
+        || r.chars().any(char::is_whitespace)
+        || a.chars().any(char::is_whitespace)
+    {
+        return None;
     }
+    Some((r, a))
 }
 
 fn seg_match(granted: &str, required: &str) -> bool {
@@ -46,5 +54,16 @@ mod tests {
         assert!(permission_matches("*:*", "logs:read"));
         assert!(permission_matches("alerts:*", "alerts:delete"));
         assert!(!permission_matches("logs:read", "keys:create"));
+    }
+
+    #[test]
+    fn unknown_role_fails_closed_and_malformed_perms_rejected() {
+        assert!(permissions_for_role("").is_empty());
+        assert!(permissions_for_role("superadmin").is_empty());
+        assert_eq!(permissions_for_role(ROLE_VIEWER).len(), 5);
+        assert!(!permission_matches("alerts", "alerts:delete"));
+        assert!(!permission_matches("", ""));
+        assert!(!permission_matches(":read", "logs:read"));
+        assert!(!permission_matches("logs:", "logs:read"));
     }
 }

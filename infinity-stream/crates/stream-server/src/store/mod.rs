@@ -6,7 +6,7 @@ use uuid::Uuid;
 use crate::config::Config;
 use crate::util::{random_token, sha256_hex};
 
-fn now() -> String {
+pub fn now() -> String {
     Utc::now().to_rfc3339()
 }
 fn future(secs: i64) -> String {
@@ -39,6 +39,7 @@ pub struct OffsetRow {
 }
 
 pub async fn seed(db: &SqlitePool, config: &Config) -> anyhow::Result<Option<String>> {
+    config.validate()?;
     // Purge expired sessions so the table cannot grow without bound.
     sqlx::query("DELETE FROM sessions WHERE expires_at <= ?")
         .bind(now())
@@ -48,8 +49,7 @@ pub async fn seed(db: &SqlitePool, config: &Config) -> anyhow::Result<Option<Str
         .fetch_one(db)
         .await?;
     if count.0 == 0 {
-        let default_placeholder = Config::default().admin_password;
-        let password = if config.admin_password == default_placeholder {
+        let password = if config.admin_password.trim().is_empty() {
             let generated = random_token();
             tracing::warn!(
                 "no STREAM_ADMIN_PASSWORD set — generated a random admin password (shown once): {}",
@@ -125,12 +125,18 @@ pub async fn session_user(db: &SqlitePool, id_hash: &str) -> sqlx::Result<Option
             .bind(id_hash)
             .fetch_optional(db)
             .await?;
-    Ok(row.and_then(|(uid, exp)| {
-        chrono::DateTime::parse_from_rfc3339(&exp)
-            .ok()
-            .filter(|t| *t > Utc::now())
-            .map(|_| uid)
-    }))
+    let Some((uid, exp)) = row else {
+        return Ok(None);
+    };
+    let valid = chrono::DateTime::parse_from_rfc3339(&exp)
+        .ok()
+        .is_some_and(|t| t > Utc::now());
+    if valid {
+        Ok(Some(uid))
+    } else {
+        let _ = delete_session(db, id_hash).await;
+        Ok(None)
+    }
 }
 
 pub async fn delete_session(db: &SqlitePool, id_hash: &str) -> sqlx::Result<()> {
@@ -187,16 +193,20 @@ pub async fn create_api_key(db: &SqlitePool, name: &str) -> sqlx::Result<(String
 }
 
 pub async fn list_api_keys(db: &SqlitePool) -> sqlx::Result<Vec<ApiKeyInfo>> {
-    sqlx::query_as::<_, ApiKeyInfo>("SELECT id, name, created_at, last_used_at, revoked_at FROM api_keys ORDER BY created_at DESC").fetch_all(db).await
+    sqlx::query_as::<_, ApiKeyInfo>(
+        "SELECT id, name, created_at, last_used_at, revoked_at FROM api_keys ORDER BY created_at DESC",
+    )
+    .fetch_all(db)
+    .await
 }
 
-pub async fn revoke_api_key(db: &SqlitePool, id: &str) -> sqlx::Result<()> {
-    sqlx::query("UPDATE api_keys SET revoked_at = ? WHERE id = ?")
+pub async fn revoke_api_key(db: &SqlitePool, id: &str) -> sqlx::Result<bool> {
+    let res = sqlx::query("UPDATE api_keys SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
         .bind(now())
         .bind(id)
         .execute(db)
         .await?;
-    Ok(())
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn create_topic(db: &SqlitePool, name: &str, partitions: i64) -> sqlx::Result<()> {
@@ -208,27 +218,32 @@ pub async fn create_topic(db: &SqlitePool, name: &str, partitions: i64) -> sqlx:
         .await?;
     Ok(())
 }
+
 pub async fn list_topics(db: &SqlitePool) -> sqlx::Result<Vec<Topic>> {
     sqlx::query_as::<_, Topic>("SELECT name, partitions, created_at FROM topics ORDER BY name")
         .fetch_all(db)
         .await
 }
+
 pub async fn get_topic(db: &SqlitePool, name: &str) -> sqlx::Result<Option<Topic>> {
     sqlx::query_as::<_, Topic>("SELECT name, partitions, created_at FROM topics WHERE name = ?")
         .bind(name)
         .fetch_optional(db)
         .await
 }
-pub async fn delete_topic(db: &SqlitePool, name: &str) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM topics WHERE name = ?")
+
+pub async fn delete_topic(db: &SqlitePool, name: &str) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    let res = sqlx::query("DELETE FROM topics WHERE name = ?")
         .bind(name)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM consumer_offsets WHERE topic = ?")
         .bind(name)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(res.rows_affected() > 0)
 }
 
 pub async fn commit_offset(
@@ -242,6 +257,7 @@ pub async fn commit_offset(
         .bind(topic).bind(group).bind(partition).bind(offset).bind(now()).execute(db).await?;
     Ok(())
 }
+
 pub async fn get_offset(
     db: &SqlitePool,
     topic: &str,
@@ -251,6 +267,7 @@ pub async fn get_offset(
     let row: Option<(i64,)> = sqlx::query_as("SELECT offset FROM consumer_offsets WHERE topic = ? AND consumer_group = ? AND partition = ?").bind(topic).bind(group).bind(partition).fetch_optional(db).await?;
     Ok(row.map(|r| r.0))
 }
+
 pub async fn list_offsets(db: &SqlitePool) -> sqlx::Result<Vec<OffsetRow>> {
     sqlx::query_as::<_, OffsetRow>("SELECT topic, consumer_group, partition, offset, updated_at FROM consumer_offsets ORDER BY updated_at DESC").fetch_all(db).await
 }
@@ -263,22 +280,27 @@ pub async fn create_index(db: &SqlitePool, name: &str) -> sqlx::Result<()> {
         .await?;
     Ok(())
 }
+
 pub async fn list_indexes(db: &SqlitePool) -> sqlx::Result<Vec<(String, String)>> {
     sqlx::query_as("SELECT name, created_at FROM search_indexes ORDER BY name")
         .fetch_all(db)
         .await
 }
-pub async fn delete_index(db: &SqlitePool, name: &str) -> sqlx::Result<()> {
-    sqlx::query("DELETE FROM search_indexes WHERE name = ?")
+
+pub async fn delete_index(db: &SqlitePool, name: &str) -> sqlx::Result<bool> {
+    let mut tx = db.begin().await?;
+    let res = sqlx::query("DELETE FROM search_indexes WHERE name = ?")
         .bind(name)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM search_docs WHERE index_name = ?")
         .bind(name)
-        .execute(db)
+        .execute(&mut *tx)
         .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(res.rows_affected() > 0)
 }
+
 pub async fn upsert_doc(
     db: &SqlitePool,
     index: &str,
@@ -289,12 +311,35 @@ pub async fn upsert_doc(
         .bind(index).bind(id).bind(fields_json).bind(now()).bind(now()).execute(db).await?;
     Ok(())
 }
+
+pub async fn upsert_docs_batch(
+    db: &SqlitePool,
+    index: &str,
+    docs: &[(String, String)],
+) -> sqlx::Result<()> {
+    let mut tx = db.begin().await?;
+    let ts = now();
+    for (id, fields_json) in docs {
+        sqlx::query("INSERT INTO search_docs (index_name, doc_id, fields_json, created_at, updated_at) VALUES (?,?,?,?,?) ON CONFLICT(index_name, doc_id) DO UPDATE SET fields_json=excluded.fields_json, updated_at=excluded.updated_at")
+            .bind(index)
+            .bind(id)
+            .bind(fields_json)
+            .bind(&ts)
+            .bind(&ts)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
 pub async fn docs_for_index(db: &SqlitePool, index: &str) -> sqlx::Result<Vec<(String, String)>> {
     sqlx::query_as("SELECT doc_id, fields_json FROM search_docs WHERE index_name = ?")
         .bind(index)
         .fetch_all(db)
         .await
 }
+
 pub async fn doc_fields(db: &SqlitePool, index: &str, id: &str) -> sqlx::Result<Option<String>> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT fields_json FROM search_docs WHERE index_name = ? AND doc_id = ?")
@@ -304,6 +349,7 @@ pub async fn doc_fields(db: &SqlitePool, index: &str, id: &str) -> sqlx::Result<
             .await?;
     Ok(row.map(|r| r.0))
 }
+
 pub async fn counts(db: &SqlitePool) -> sqlx::Result<(i64, i64, i64)> {
     let topics: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM topics")
         .fetch_one(db)

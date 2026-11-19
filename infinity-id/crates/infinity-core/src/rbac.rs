@@ -6,10 +6,15 @@
 
 /// Returns true if `granted` satisfies the `required` permission.
 ///
-/// `*` matches any single segment. Comparison is case-sensitive.
+/// Both permissions must follow strict `resource:action` format with non-empty
+/// segments; `*` matches any single segment. Comparison is case-sensitive.
 pub fn permission_matches(granted: &str, required: &str) -> bool {
-    let (gr, ga) = split(granted);
-    let (rr, ra) = split(required);
+    let Some((gr, ga)) = split_strict(granted) else {
+        return false;
+    };
+    let Some((rr, ra)) = split_strict(required) else {
+        return false;
+    };
     seg_match(gr, rr) && seg_match(ga, ra)
 }
 
@@ -18,11 +23,17 @@ pub fn any_permission(granted: &[String], required: &str) -> bool {
     granted.iter().any(|g| permission_matches(g, required))
 }
 
-fn split(p: &str) -> (&str, &str) {
-    match p.split_once(':') {
-        Some((r, a)) => (r, a),
-        None => (p, "*"),
+/// Validate `resource:action` syntax (two non-empty segments, no whitespace).
+pub fn is_valid_permission(p: &str) -> bool {
+    split_strict(p).is_some() && !p.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+fn split_strict(p: &str) -> Option<(&str, &str)> {
+    let (r, a) = p.split_once(':')?;
+    if r.is_empty() || a.is_empty() || a.contains(':') {
+        return None;
     }
+    Some((r, a))
 }
 
 fn seg_match(granted: &str, required: &str) -> bool {
@@ -45,6 +56,11 @@ mod tests {
         assert!(permission_matches("users:read", "users:read"));
         assert!(!permission_matches("users:read", "users:delete"));
         assert!(!permission_matches("clients:*", "users:read"));
+        assert!(!permission_matches("users", "users:delete"));
+        assert!(!permission_matches("*", "users:delete"));
+        assert!(!permission_matches("", "users:read"));
+        assert!(!permission_matches("users:", "users:read"));
+        assert!(!permission_matches(":read", "users:read"));
     }
 
     #[test]

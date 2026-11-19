@@ -7,6 +7,9 @@ use crate::auth::Principal;
 use crate::error::{ApiError, ApiResult};
 use crate::state::SharedState;
 use crate::store;
+use crate::util::has_control_or_bidi;
+
+const MAX_INGEST_KEYS: i64 = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateKey {
@@ -30,8 +33,15 @@ pub async fn create(
     principal.require("keys:create")?;
     let name = req.name.unwrap_or_else(|| "dashboard".into());
     let name = name.trim();
-    if name.is_empty() || name.len() > 80 {
-        return Err(ApiError::BadRequest("name must be 1-80 characters".into()));
+    if name.is_empty() || name.len() > 80 || has_control_or_bidi(name) {
+        return Err(ApiError::BadRequest(
+            "name must be 1-80 characters without control characters".into(),
+        ));
+    }
+    if store::count_ingest_keys(&st.db).await? >= MAX_INGEST_KEYS {
+        return Err(ApiError::BadRequest(
+            "maximum number of ingest keys reached".into(),
+        ));
     }
     let (key, token) = store::create_ingest_key(&st.db, name)
         .await
@@ -52,6 +62,9 @@ pub async fn revoke(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("keys:delete")?;
+    if id.trim().is_empty() || id.len() > 128 || has_control_or_bidi(&id) {
+        return Err(ApiError::BadRequest("invalid ingest key id".into()));
+    }
     store::revoke_ingest_key(&st.db, &id).await?;
     Ok(Json(json!({ "ok": true })))
 }

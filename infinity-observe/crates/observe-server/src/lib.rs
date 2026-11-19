@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod ratelimit;
 pub mod routes;
+pub mod ssrf;
 pub mod state;
 pub mod store;
 pub mod throttle;

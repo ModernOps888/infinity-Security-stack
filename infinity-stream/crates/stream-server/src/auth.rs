@@ -1,5 +1,6 @@
 use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
+use axum::http::HeaderMap;
 
 use crate::error::ApiError;
 use crate::state::SharedState;
@@ -7,6 +8,8 @@ use crate::store;
 use crate::util::sha256_hex;
 
 pub const SESSION_COOKIE: &str = "infinity_session";
+const MAX_BEARER_LEN: usize = 256;
+const MAX_COOKIE_LEN: usize = 256;
 
 /// Least-privilege permission set granted to API keys. Data-plane only —
 /// keys can produce/consume/search and create topics/indexes, but CANNOT
@@ -50,15 +53,13 @@ impl Principal {
     }
 }
 
-fn cookie_value(parts: &Parts, name: &str) -> Option<String> {
-    let header = parts
-        .headers
-        .get(axum::http::header::COOKIE)?
-        .to_str()
-        .ok()?;
+pub fn extract_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    let header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     header.split(';').find_map(|kv| {
         let (k, v) = kv.trim().split_once('=')?;
-        (k == name).then(|| v.to_string())
+        let val = v.trim();
+        (k.trim() == name && !val.is_empty() && val.len() <= MAX_COOKIE_LEN)
+            .then(|| val.to_string())
     })
 }
 
@@ -70,22 +71,32 @@ impl FromRequestParts<SharedState> for Principal {
         parts: &mut Parts,
         state: &SharedState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(auth) = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|h| h.to_str().ok())
-        {
-            if let Some(token) = auth.strip_prefix("Bearer ") {
-                if let Some(id) = store::api_key_subject(&state.db, &sha256_hex(token)).await? {
-                    return Ok(Principal {
-                        subject: id,
-                        kind: PrincipalKind::ApiKey,
-                        permissions: API_KEY_SCOPE.iter().map(|s| s.to_string()).collect(),
-                    });
-                }
+        // If an Authorization header is explicitly supplied, never silently
+        // fall back to an ambient session cookie if the Bearer token is invalid.
+        if let Some(auth_val) = parts.headers.get(axum::http::header::AUTHORIZATION) {
+            let auth = auth_val
+                .to_str()
+                .map_err(|_| ApiError::Unauthorized("invalid authorization header".into()))?;
+            let token = auth
+                .strip_prefix("Bearer ")
+                .map(str::trim)
+                .filter(|t| {
+                    !t.is_empty()
+                        && t.len() <= MAX_BEARER_LEN
+                        && !t.chars().any(|c| c.is_control() || c.is_whitespace())
+                })
+                .ok_or_else(|| ApiError::Unauthorized("invalid bearer token".into()))?;
+            if let Some(id) = store::api_key_subject(&state.db, &sha256_hex(token)).await? {
+                return Ok(Principal {
+                    subject: id,
+                    kind: PrincipalKind::ApiKey,
+                    permissions: API_KEY_SCOPE.iter().map(|s| s.to_string()).collect(),
+                });
             }
+            return Err(ApiError::Unauthorized("invalid or revoked API key".into()));
         }
-        if let Some(raw) = cookie_value(parts, SESSION_COOKIE) {
+
+        if let Some(raw) = extract_cookie(&parts.headers, SESSION_COOKIE) {
             if let Some(uid) = store::session_user(&state.db, &sha256_hex(&raw)).await? {
                 return Ok(Principal {
                     subject: uid,

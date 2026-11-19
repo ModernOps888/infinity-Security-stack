@@ -25,3 +25,9 @@ anyhow = { workspace = true }
 figment = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
+ipnet = "2"
+percent-encoding = "2"
+
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"

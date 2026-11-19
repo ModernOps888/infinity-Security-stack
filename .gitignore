@@ -14,8 +14,41 @@ signing_key.pem
 
 # Env
 .env
+**/.env
+.env.*
+**/.env.*
+!.env.example
+!**/.env.example
 
 *.err
 
 # internal launch kit - do not publish
 marketing/
+
+# Additional keys, certs, and local databases
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.der
+*.sqlite
+*.sqlite*
+*.sqlite3
+*.sqlite3-*
+
+# Local operator config overrides (keep *.example tracked)
+Config.toml
+Edge.toml
+
+# OS, editor, and temporary files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*.swo
+*~
+*.tmp
+*.bak
+.vscode/
+.idea/

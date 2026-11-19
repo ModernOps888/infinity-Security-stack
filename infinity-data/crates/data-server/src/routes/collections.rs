@@ -1,9 +1,10 @@
 use axum::extract::{Path, State};
 use axum::Json;
-use data_core::hnsw::{HnswIndex, Point};
+use data_core::hnsw::{HnswIndex, Point, MAX_DIM, MAX_EF_SEARCH};
 use data_core::model::{CollectionInfo, Metric};
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -12,6 +13,8 @@ use crate::error::{ApiError, ApiResult};
 use crate::routes::valid_name;
 use crate::state::SharedState;
 use crate::store;
+
+const MAX_API_TOP_K: usize = 100;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateCollection {
@@ -87,6 +90,9 @@ pub async fn get_one(
     principal: Principal,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("collections:read")?;
+    if !valid_name(&name) {
+        return Err(ApiError::BadRequest("invalid collection name".into()));
+    }
     let c = store::get_collection(&st.db, &name)
         .await?
         .ok_or_else(|| ApiError::NotFound("collection not found".into()))?;
@@ -108,20 +114,18 @@ pub async fn create(
             "collection name must be 1-64 characters: letters, numbers, '_' or '-'".into(),
         ));
     }
-    if req.dim == 0 || req.dim > 4096 {
-        return Err(ApiError::BadRequest(
-            "dimension must be between 1 and 4096".into(),
-        ));
+    if req.dim == 0 || req.dim > MAX_DIM {
+        return Err(ApiError::BadRequest(format!(
+            "dimension must be between 1 and {MAX_DIM}"
+        )));
     }
     if store::get_collection(&st.db, name).await?.is_some() {
         return Err(ApiError::Conflict("collection already exists".into()));
     }
     let metric = Metric::from_str(&req.metric).map_err(ApiError::BadRequest)?;
+    let new_index = HnswIndex::new(req.dim, metric, 16, 128)?;
     store::insert_collection(&st.db, name, req.dim, metric).await?;
-    st.indexes
-        .write()
-        .await
-        .insert(name.to_string(), HnswIndex::new(req.dim, metric, 16, 128)?);
+    st.indexes.write().await.insert(name.to_string(), new_index);
     store::audit(
         &st.db,
         Some(&principal.user_id),
@@ -141,11 +145,16 @@ pub async fn delete_one(
     principal: Principal,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("collections:write")?;
+    if !valid_name(&name) {
+        return Err(ApiError::BadRequest("invalid collection name".into()));
+    }
     if store::get_collection(&st.db, &name).await?.is_none() {
         return Err(ApiError::NotFound("collection not found".into()));
     }
+    let mut indexes = st.indexes.write().await;
     store::delete_collection(&st.db, &name).await?;
-    st.indexes.write().await.remove(&name);
+    indexes.remove(&name);
+    drop(indexes);
     store::audit(
         &st.db,
         Some(&principal.user_id),
@@ -166,6 +175,9 @@ pub async fn upsert_vectors(
     Json(req): Json<UpsertVectors>,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("data:write")?;
+    if !valid_name(&name) {
+        return Err(ApiError::BadRequest("invalid collection name".into()));
+    }
     let c = store::get_collection(&st.db, &name)
         .await?
         .ok_or_else(|| ApiError::NotFound("collection not found".into()))?;
@@ -189,9 +201,9 @@ pub async fn upsert_vectors(
             ));
         }
         let id = p.id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        if id.len() > 128 || id.is_empty() {
+        if id.len() > 128 || id.is_empty() || id.chars().any(char::is_control) {
             return Err(ApiError::BadRequest(
-                "point id must be 1-128 characters".into(),
+                "point id must be 1-128 non-control characters".into(),
             ));
         }
         points.push(Point {
@@ -202,14 +214,30 @@ pub async fn upsert_vectors(
     }
     {
         let mut indexes = st.indexes.write().await;
+        if store::get_collection(&st.db, &name).await?.is_none() {
+            return Err(ApiError::NotFound("collection not found".into()));
+        }
         let index = indexes
             .entry(name.clone())
             .or_insert(HnswIndex::new(c.dim, c.metric, 16, 128)?);
+        let mut new_unique = HashSet::new();
+        for p in &points {
+            if index.point(&p.id).is_none() {
+                new_unique.insert(p.id.as_str());
+            }
+        }
+        if index.len().saturating_add(new_unique.len()) > st.config.max_vectors_per_collection {
+            return Err(ApiError::BadRequest(format!(
+                "collection vector limit ({}) exceeded",
+                st.config.max_vectors_per_collection
+            )));
+        }
+        // Persist to SQLite before mutating in-memory HNSW so DB failure cannot diverge index state.
+        store::upsert_points(&st.db, &name, &points).await?;
         for p in points.clone() {
             index.insert(p)?;
         }
     }
-    store::upsert_points(&st.db, &name, &points).await?;
     store::audit(
         &st.db,
         Some(&principal.user_id),
@@ -230,6 +258,9 @@ pub async fn search(
     Json(req): Json<SearchRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     principal.require("data:read")?;
+    if !valid_name(&name) {
+        return Err(ApiError::BadRequest("invalid collection name".into()));
+    }
     let c = store::get_collection(&st.db, &name)
         .await?
         .ok_or_else(|| ApiError::NotFound("collection not found".into()))?;
@@ -245,8 +276,18 @@ pub async fn search(
             "query vector must contain only finite numbers".into(),
         ));
     }
-    let k = req.k.clamp(1, 100);
-    let ef = req.ef.unwrap_or(k * 8).clamp(k, 10_000);
+    if req.k == 0 || req.k > MAX_API_TOP_K {
+        return Err(ApiError::BadRequest(format!(
+            "k must be between 1 and {MAX_API_TOP_K}"
+        )));
+    }
+    let k = req.k;
+    let ef = req.ef.unwrap_or(k * 8).max(k);
+    if ef > MAX_EF_SEARCH {
+        return Err(ApiError::BadRequest(format!(
+            "ef must be <= {MAX_EF_SEARCH}"
+        )));
+    }
     let hits = {
         let indexes = st.indexes.read().await;
         let idx = indexes

@@ -1,16 +1,20 @@
-use axum::extract::State;
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, State};
 use axum::http::header::SET_COOKIE;
-use axum::http::HeaderValue;
+use axum::http::{HeaderMap, HeaderValue};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::{Principal, SESSION_COOKIE};
+use crate::auth::{cookie_value, Principal, SESSION_COOKIE};
 use crate::error::{ApiError, ApiResult};
 use crate::state::SharedState;
 use crate::store;
-use crate::util::{random_token, sha256_hex};
+use crate::util::{self, random_token, sha256_hex};
+
+const MAX_IP_LOGIN_FAILS: u32 = 30;
 
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
@@ -37,15 +41,37 @@ fn clear_cookie(secure: bool) -> String {
     }
 }
 
+fn header_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let header = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
+    header.split(';').find_map(|kv| {
+        let (k, v) = kv.trim().split_once('=')?;
+        (k == name).then(|| v.to_string())
+    })
+}
+
 pub async fn login(
     State(st): State<SharedState>,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> ApiResult<Response> {
     let email = req.email.trim().to_ascii_lowercase();
-    if email.len() > 254 || req.password.len() > 1024 {
+    let proxies = util::parse_trusted_proxies(&st.config.trusted_proxies);
+    let client_ip = util::extract_client_ip(&headers, peer.map(|c| c.0), &proxies);
+    let ua = util::sanitize_user_agent(&headers);
+    let acct_key = format!("acct:{email}");
+    let ip_key = format!("ip:{client_ip}");
+
+    if email.is_empty() || email.len() > 254 || req.password.len() > 1024 {
+        data_core::password::dummy_verify(&req.password);
         return Err(ApiError::Unauthorized("invalid credentials".into()));
     }
-    if let Err(retry) = st.login_throttle.check(&email) {
+    if let Err(retry) = st.login_throttle.check(&acct_key) {
+        return Err(ApiError::TooManyRequests(format!(
+            "too many attempts; retry in {retry}s"
+        )));
+    }
+    if let Err(retry) = st.login_throttle.check(&ip_key) {
         return Err(ApiError::TooManyRequests(format!(
             "too many attempts; retry in {retry}s"
         )));
@@ -53,48 +79,61 @@ pub async fn login(
 
     let Some(user) = store::get_user_by_email(&st.db, &email).await? else {
         data_core::password::dummy_verify(&req.password);
-        st.login_throttle.record_failure(&email);
+        st.login_throttle.record_failure(&acct_key);
+        st.login_throttle
+            .record_failure_with_limit(&ip_key, MAX_IP_LOGIN_FAILS);
         store::audit(
             &st.db,
             None,
             "login.fail",
             Some("unknown"),
             None,
-            None,
-            None,
+            Some(&client_ip),
+            ua.as_deref(),
         )
         .await;
         return Err(ApiError::Unauthorized("invalid credentials".into()));
     };
     if !data_core::password::verify_password(&req.password, &user.password_hash)? {
-        st.login_throttle.record_failure(&email);
+        st.login_throttle.record_failure(&acct_key);
+        st.login_throttle
+            .record_failure_with_limit(&ip_key, MAX_IP_LOGIN_FAILS);
         store::audit(
             &st.db,
             Some(&user.id),
             "login.fail",
             Some("user"),
             None,
-            None,
-            None,
+            Some(&client_ip),
+            ua.as_deref(),
         )
         .await;
         return Err(ApiError::Unauthorized("invalid credentials".into()));
     }
     if user.disabled != 0 {
-        st.login_throttle.record_failure(&email);
+        st.login_throttle.record_failure(&acct_key);
+        st.login_throttle
+            .record_failure_with_limit(&ip_key, MAX_IP_LOGIN_FAILS);
         store::audit(
             &st.db,
             Some(&user.id),
             "login.fail",
             Some("user"),
             None,
-            None,
-            None,
+            Some(&client_ip),
+            ua.as_deref(),
         )
         .await;
         return Err(ApiError::Unauthorized("invalid credentials".into()));
     }
-    st.login_throttle.record_success(&email);
+    st.login_throttle.record_success(&acct_key);
+    st.login_throttle.record_success(&ip_key);
+
+    // Session fixation defense: revoke any pre-existing session cookie on the login request
+    // and always bind a fresh CSPRNG session identifier.
+    if let Some(old_raw) = header_cookie_value(&headers, SESSION_COOKIE) {
+        let _ = store::delete_session(&st.db, &sha256_hex(&old_raw)).await;
+    }
 
     let session = random_token();
     store::create_session(
@@ -110,8 +149,8 @@ pub async fn login(
         "login.success",
         Some("user"),
         None,
-        None,
-        None,
+        Some(&client_ip),
+        ua.as_deref(),
     )
     .await;
     let roles = store::user_roles(&st.db, &user.id).await?;
@@ -132,29 +171,28 @@ pub async fn login(
 
 pub async fn logout(
     State(st): State<SharedState>,
-    headers: axum::http::HeaderMap,
+    peer: Option<ConnectInfo<SocketAddr>>,
+    headers: HeaderMap,
     principal: Principal,
 ) -> ApiResult<Response> {
-    if let Some(raw) = headers
-        .get(axum::http::header::COOKIE)
-        .and_then(|c| c.to_str().ok())
-        .and_then(|c| {
-            c.split(';').find_map(|kv| {
-                let (k, v) = kv.trim().split_once('=')?;
-                (k == SESSION_COOKIE).then(|| v.to_string())
-            })
-        })
-    {
+    if principal.user_id.starts_with("api_key:") {
+        return Err(ApiError::Forbidden("user session required".into()));
+    }
+    let proxies = util::parse_trusted_proxies(&st.config.trusted_proxies);
+    let client_ip = util::extract_client_ip(&headers, peer.map(|c| c.0), &proxies);
+    let ua = util::sanitize_user_agent(&headers);
+    if let Some(raw) = header_cookie_value(&headers, SESSION_COOKIE) {
         store::delete_session(&st.db, &sha256_hex(&raw)).await?;
     }
+    let _ = cookie_value;
     store::audit(
         &st.db,
         Some(&principal.user_id),
         "logout",
         Some("session"),
         None,
-        None,
-        None,
+        Some(&client_ip),
+        ua.as_deref(),
     )
     .await;
     let mut resp = Json(json!({"ok": true})).into_response();
@@ -170,6 +208,9 @@ pub async fn me(
     State(st): State<SharedState>,
     principal: Principal,
 ) -> ApiResult<Json<serde_json::Value>> {
+    if principal.user_id.starts_with("api_key:") {
+        return Err(ApiError::Forbidden("user session required".into()));
+    }
     let user = store::get_user(&st.db, &principal.user_id)
         .await?
         .ok_or_else(|| ApiError::NotFound("user not found".into()))?;

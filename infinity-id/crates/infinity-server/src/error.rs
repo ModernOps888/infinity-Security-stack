@@ -61,7 +61,10 @@ impl From<CoreError> for ApiError {
     fn from(e: CoreError) -> Self {
         match e {
             CoreError::Invalid(m) => ApiError::BadRequest(m),
-            CoreError::Token(m) => ApiError::Unauthorized(m),
+            CoreError::Token(detail) => {
+                tracing::debug!(error = %detail, "token validation failed");
+                ApiError::Unauthorized("invalid or expired token".into())
+            }
             other => ApiError::Internal(other.to_string()),
         }
     }

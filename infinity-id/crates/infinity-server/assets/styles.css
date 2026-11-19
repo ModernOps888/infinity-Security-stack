@@ -144,3 +144,11 @@ code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; 
 }
 .rec-codes { display:grid; grid-template-columns: repeat(2,1fr); gap:8px; }
 .rec-codes span { background:#0a1226; border:1px solid var(--line); border-radius:8px; padding:8px; text-align:center; }
+.text-right { text-align: right; }
+.mt-16 { margin-top: 16px; }
+.max-w-320 { max-width: 320px; }
+.mfa-disable-row { display: flex; gap: 10px; align-items: center; max-width: 440px; flex-wrap: wrap; }
+.mfa-disable-row input {
+  flex: 1; min-width: 200px; padding: 10px 12px; border-radius: 10px;
+  border: 1px solid var(--line); background: #0e1730; color: var(--text); font-size: 14px; outline: none;
+}

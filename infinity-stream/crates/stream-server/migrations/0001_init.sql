@@ -1,4 +1,4 @@
-﻿-- Infinity Stream initial schema (SQLite). Timestamps are RFC3339 TEXT UTC.
+-- Infinity Stream initial schema (SQLite). Timestamps are RFC3339 TEXT UTC.
 CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
     email TEXT NOT NULL UNIQUE,

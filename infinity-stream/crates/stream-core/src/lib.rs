@@ -1,4 +1,4 @@
-﻿//! stream-core — durable streaming and search primitives for Infinity Stream.
+//! stream-core — durable streaming and search primitives for Infinity Stream.
 
 pub mod bm25;
 pub mod commit_log;

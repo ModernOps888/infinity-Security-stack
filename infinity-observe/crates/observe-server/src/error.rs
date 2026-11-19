@@ -33,7 +33,8 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         if let ApiError::Internal(detail) = &self {
-            tracing::error!(error = %detail, "internal server error");
+            let safe_detail = crate::util::sanitize_log_text(detail);
+            tracing::error!(error = %safe_detail, "internal server error");
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({
@@ -44,9 +45,10 @@ impl IntoResponse for ApiError {
                 .into_response();
         }
         let (status, code, msg) = self.parts();
+        let safe_msg = crate::util::sanitize_log_text(msg);
         (
             status,
-            Json(json!({ "error": code, "error_description": msg })),
+            Json(json!({ "error": code, "error_description": safe_msg })),
         )
             .into_response()
     }
