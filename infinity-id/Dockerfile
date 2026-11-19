@@ -1,5 +1,5 @@
 # ---- Build stage ---------------------------------------------------------
-FROM rust:1.94-slim AS builder
+FROM rust:1.99-slim AS builder
 WORKDIR /app
 
 # ring / rsa need a C toolchain; ca-certificates for TLS at build time.
