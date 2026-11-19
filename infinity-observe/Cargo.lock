@@ -1129,7 +1129,7 @@ name = "observe-core"
 version = "0.1.0"
 dependencies = [
  "argon2",
- "base64 0.22.1",
+ "base64 0.23.1",
  "rand 0.8.8",
  "serde",
  "sha2 0.10.9",
@@ -1142,7 +1142,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "base64 0.22.1",
+ "base64 0.23.1",
  "chrono",
  "figment",
  "mime_guess",
